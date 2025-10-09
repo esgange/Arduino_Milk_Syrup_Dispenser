@@ -1,6 +1,6 @@
 /*
-  Mega 2560 — One-Shot Dispenser + Leak Monitor
-  (low-speed at TARGET − slowOffset_g, soft-cut at TARGET − softCutOffset_g, no top-off)
+  Mega 2560 — One-Shot Dispenser + Leak Monitor + Modbus RTU
+  API style: Only STATUS, CLEAR, DISPENSE, RINSE, TRIGGER exposed via Modbus
 
   ==================== Modbus RTU Slave API (single-shot) ====================
   Wiring & link:
@@ -9,74 +9,72 @@
     - Bus port  -> Serial3 @ 19200 8N1
     - Slave ID  -> 1
 
-  Protocol:
-    - Use Function 0x17 (Read/Write Multiple Registers) as a single transaction.
-      Master writes a command block (opcode + args + seq) and requests a read
-      from the result block. The slave executes the command to completion (or
-      until it fails), then returns the result in the SAME response.
-      Master must set a generous timeout (≥ longest dispense/timeout).
+  Wire-level function code:
+    - Only **0x17 Read/Write Multiple Registers** is accepted.
+      Any other Modbus function code returns Exception 0x01 (Illegal Function).
 
-    - Register map (Holding registers, 16-bit big-endian per Modbus):
-      Command Block @ 0x0000
-        0x0000  opcode:
-                  1=STATUS, 2=CLEAR, 3=LIST, 10=DISPENSE, 11=RINSE, 12=TRIGGER
-        0x0001  seq (echoed back)
-        0x0002  arg0  (varies by opcode)
-        0x0003  arg1
-        0x0004  arg2
-        0x0005  arg3
-        0x0006  arg4
-        0x0007  arg5
-        (unused beyond if not needed)
+  Transaction model (single-shot):
+    - Master writes a Command Block and requests a read of the Result Block
+      in the **same** 0x17 transaction.
+    - Slave executes the command to completion (or until it fails), then fills
+      the Result Block for that same response (set a generous master timeout).
 
-      Result Block @ 0x0100
-        0x0100  resultCode: 0=ALL_OK,1=FAIL,2=BUSY,3=INVALID_CMD,4=BAD_ARGS
-        0x0101  faultCode : 0=NONE,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT
-        0x0102  systemStatus (same enum as sketch)
-        0x0103  seq (echo)
-        0x0104  aux0 = lastWeight_x10
-        0x0105  aux1 = elapsed_s_x10 (if applicable)
-        0x0106  aux2 = activeScaleId (1=MILK,2=SAUCE) at reply time
-        0x0107  aux3 = reserved
-        0x0108  list_mask_milk (bit i=1..8 ON=pin HIGH)
-        0x0109  list_mask_sauce_low  (bits 1..16 for Sauce1..Sauce16; we use 15)
-        0x010A  list_mask_sauce_high (unused, 0)
-        (unused beyond if not needed)
+  Register map (Holding registers, 16-bit big-endian per Modbus):
+    Command Block @ 0x0000
+      0x0000  opcode:
+                1=STATUS, 2=CLEAR, 10=DISPENSE, 11=RINSE, 12=TRIGGER
+      0x0001  seq (echoed back)
+      0x0002  arg0
+      0x0003  arg1
+      0x0004  arg2
+      0x0006  arg4
+      0x0007  arg5
 
-    - Args by opcode:
-      DISPENSE (10):
-        arg0 = motorId: Milk1..8 => 1..8; Sauce1..15 => 101..115
-        arg1 = target_x10 (e.g., 100g -> 1000)
-        arg2 = slowOffset_x10 (e.g., 2g -> 20)
-        arg3 = softCutOffset_x10 (e.g., 1g -> 10)
-        arg4 = timeout_s
-      RINSE (11):
-        arg0 = seconds_x10 (e.g., 3.5s -> 35)
-      TRIGGER (12):
-        arg0 = motorId (same as dispense)
-        arg1 = seconds_x10
+    Result Block @ 0x0100  (API-style minimalist outcome)
+      0x0100  resultCode: 0=OK, 1=FAIL
+      0x0101  errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD
+      0x0102  systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT
+      0x0103  seq (echo)
+      0x0104  aux0 = lastWeight_x10         (optional convenience)
+      0x0105  aux1 = elapsed_s_x10          (if applicable)
+      0x0106  aux2 = activeScaleId (1=MILK,2=SAUCE)
+      0x0107  aux3 = reserved (0)
+      0x0108  0 (unused)
+      0x0109  0 (unused)
+      0x010A  0 (unused)
 
-    - Behavior:
-      * If the system is already in a FAULT state on receipt → do not execute,
-        reply FAIL + current fault.
-      * If a FAULT occurs during execution → abort via existing logic and reply FAIL + that fault.
-      * On success, status returns to IDLE (ALL_OK).
-      * Single in-flight command; if a command is executing, we reply BUSY to new requests.
+  Args by opcode:
+    DISPENSE (10):
+      arg0 = motorId: Milk1..8 => 1..8; Sauce1..15 => 101..115
+      arg1 = target_x10 (e.g., 20 g -> 200)
+      arg2 = slowOffset_x10 (e.g., 15 g -> 150)  // low speed at target - slowOffset
+      arg3 = softCutOffset_x10 (e.g., 1.5 g -> 15) // motor OFF at target - softCutOffset, then coast
+      arg4 = timeout_s
+    RINSE (11):
+      arg0 = seconds_x10 (e.g., 3.5 s -> 35)
+    TRIGGER (12):
+      arg0 = motorId (same mapping as dispense)
+      arg1 = seconds_x10
 
-  ==================== End Modbus RTU section ====================
+  API behavior:
+    - Only commands above are handled via Modbus. No LIST or other diagnostics via Modbus.
+    - STATUS always returns current status (OK + systemStatus).
+    - CLEAR clears latched faults; returns OK.
+    - If a command is already in progress, any new command returns FAIL + errorCode=BUSY.
+    - If the system is faulted on receipt (and command ≠ CLEAR), return FAIL + errorCode=<fault>.
+    - If arguments are bad, return FAIL + errorCode=BAD_ARGS.
+    - If opcode unsupported, return FAIL + errorCode=INVALID_CMD.
 
-  Features (unchanged control logic):
-    - Two leak channels on same polarity: ACTIVE-HIGH = LEAK (LMV331 OUT -> A5 & A8, sensor VCC -> A6 & A9).
-      * 1.0 s sampling, binary detection (OK / LEAK), 1 s debounce.
-    - Fault debouncing window = 1.0 s for motor (ACTIVE-LOW) and leak; scale I²C faults are immediate.
-    - systemStatus: IDLE / ACTIVE / MOTOR FAULT / LEAK FAULT / SCALE FAULT / DISPENSE TIMEOUT FAULT.
-    - Latched faultFlag: set on any fault; cleared by 'clear'.
-    - Two I²C scales on the same bus (MILK & SAUCE).
-    - Motor start delay: default 2.0 s (motorStartDelay_s).
-    - Serial CLI (kept for bench): help, list, status, clear,
-        dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>,
-        rinse <seconds>,
-        trigger <motor> <seconds>
+  Dispense control logic (unchanged semantics):
+    - Switch to LOW speed at (target − slowOffset_g).
+    - Motor OFF at (target − softCutOffset_g), settle, then coast (no top-off).
+    - Timeouts, motor/leak/scale faults handled with existing debounce logic.
+
+  Serial CLI (diagnostics/bench only; not exposed via Modbus):
+    help, list, status, clear,
+    dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>,
+    rinse <seconds>,
+    trigger <motor> <seconds>
 */
 
 #include <Wire.h>
@@ -100,13 +98,16 @@ const unsigned long LEAK_SAMPLE_MS    = 1000;
 #define REG_SPACE_SIZE   0x0120
 static uint16_t regSpace[REG_SPACE_SIZE]; // holding register image
 
-// Result codes
-enum ResultCode : uint16_t { RC_ALL_OK=0, RC_FAIL=1, RC_BUSY=2, RC_BAD_FUNC=3, RC_BAD_ARGS=4 };
-// Fault codes (for API result)
-enum ApiFault : uint16_t { AF_NONE=0, AF_MOTOR=2, AF_LEAK=3, AF_SCALE=4, AF_TIMEOUT=5 };
+// API result codes (binary outcome)
+enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 
-// Opcodes
-enum Opcode : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_LIST=3, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
+// API error codes (details when RC_FAIL)
+enum ApiError : uint16_t {
+  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7
+};
+
+// Opcodes exposed on Modbus
+enum Opcode : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
 
 // Busy flag to serialize API calls
 volatile bool apiBusy = false;
@@ -116,8 +117,10 @@ static uint16_t mb_crc16(const uint8_t* data, uint16_t len);
 static void rs485RxMode();
 static void rs485TxMode();
 static void handleModbus();         // polls link, executes one command if received
-static void buildResult(uint16_t rc, uint16_t seq);
-static uint16_t faultToApiFault(uint8_t systemStatus);
+static void buildResult(uint16_t rc, uint16_t seq, uint16_t err);
+static uint16_t faultToApiError(uint8_t systemStatus);
+const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD; // ~573 us @19200
+const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0 ms
 
 // ===================== Scale config (variables only) =====================
 const uint8_t MILK_SCALE_ADDR  = 0x2A;
@@ -326,7 +329,7 @@ bool parseMotorSelector(const String& token, int &pinOut, char *nameOut, size_t 
   if (t.startsWith("m"))     return pick(t.substring(1).toInt(), MILK_NAMES,  MILK_PINS,  8);
   if (t.startsWith("s"))     return pick(t.substring(1).toInt(), SAUCE_NAMES, SAUCE_PINS, 15);
 
-  // Numeric pin support for direct pin use (not used by CLI for motors anymore)
+  // Numeric pin support (CLI only)
   bool numeric = true;
   for (uint16_t i=0;i<t.length();++i) if (!isDigit(t[i])) { numeric=false; break; }
   if (numeric && t.length()>0) {
@@ -419,7 +422,7 @@ void printList() {
 
 // ===================== Core dispense logic =====================
 //   slowOffset_g      -> switch to LOW speed at target - slowOffset_g
-//   softCutOffset_g   -> stop motor at target - softCutOffset_g (then settle & coast)
+//   softCutOffset_g   -> stop motor at target - softCutOffset_g (then settle & coast; no top-off)
 void startDispense(int pin, const char* name, float slowOffset_g, float softCutOffset_g, unsigned long timeout_s, uint16_t tgt_x10) {
   if (timeout_s == 0) timeout_s = 30;
   if (timeout_s*1000UL > MAX_TIMEOUT_MS) timeout_s = MAX_TIMEOUT_MS/1000UL;
@@ -765,7 +768,7 @@ void loop() {
   // Keep running the normal state machine
   pumpCore();
 
-  // Serial CLI (left intact for bench; disabled while API is executing)
+  // Serial CLI (bench/diagnostics only; Modbus API excludes these extras)
   static String line;
   if (!apiBusy) {
     while (Serial.available()) {
@@ -898,31 +901,29 @@ static inline void regWrite(uint16_t addr, uint16_t val) {
   if (addr < REG_SPACE_SIZE) regSpace[addr] = val;
 }
 
-// Map systemStatus to API fault code
-static uint16_t faultToApiFault(uint8_t st) {
+// Map systemStatus to API error code
+static uint16_t faultToApiError(uint8_t st) {
   switch (st) {
-    case SYS_MOTOR_FAULT:   return AF_MOTOR;
-    case SYS_LEAK_FAULT:    return AF_LEAK;
-    case SYS_SCALE_FAULT:   return AF_SCALE;
-    case SYS_TIMEOUT_FAULT: return AF_TIMEOUT;
-    default: return AF_NONE;
+    case SYS_MOTOR_FAULT:   return AE_MOTOR;
+    case SYS_LEAK_FAULT:    return AE_LEAK;
+    case SYS_SCALE_FAULT:   return AE_SCALE;
+    case SYS_TIMEOUT_FAULT: return AE_TIMEOUT;
+    default: return AE_NONE;
   }
 }
 
-// Build minimal LIST bitmasks (for result block)
-static void buildListMasks(uint16_t &milkMask, uint16_t &sauceLo, uint16_t &sauceHi) {
-  milkMask = 0;
-  for (uint8_t i=0;i<8;i++) {
-    if (digitalRead(MILK_PINS[i])) milkMask |= (1u << (i+1)); // bits 1..8
-  }
-  sauceLo = 0; sauceHi = 0;
-  for (uint8_t i=0;i<15;i++) {
-    if (digitalRead(SAUCE_PINS[i])) {
-      uint8_t bit = i+1; // 1..15
-      if (bit <= 16) sauceLo |= (1u << bit);
-      else           sauceHi |= (1u << (bit-16));
-    }
-  }
+// Fill standard result block @0x0100 (and zero unused)
+static void buildResult(uint16_t rc, uint16_t seq, uint16_t err) {
+  regWrite(0x0100, rc);
+  regWrite(0x0101, err);
+  regWrite(0x0102, (uint16_t)systemStatus);
+  regWrite(0x0103, seq);
+  regWrite(0x0104, lastWeight_x10);
+  regWrite(0x0106, activeScaleId());
+  regWrite(0x0107, 0);
+  regWrite(0x0108, 0);
+  regWrite(0x0109, 0);
+  regWrite(0x010A, 0);
 }
 
 // Helpers to resolve motorId -> pin/name
@@ -941,41 +942,34 @@ static bool motorIdToPinName(uint16_t motorId, int &pin, const char* &nm) {
   return false;
 }
 
-// Blocking executor: runs existing logic unchanged, pumps state until done
+// Blocking executor: conforms to API-style OK/FAIL + errorCode
 static void executeOpcode(uint16_t opcode, uint16_t seq) {
-  uint16_t resultCode = RC_ALL_OK;
+  // If system currently in a fault, only CLEAR is accepted.
+  bool hasFault =
+      (systemStatus == SYS_MOTOR_FAULT) ||
+      (systemStatus == SYS_LEAK_FAULT)  ||
+      (systemStatus == SYS_SCALE_FAULT) ||
+      (systemStatus == SYS_TIMEOUT_FAULT);
 
-  // Pre-fault check
-  if (systemStatus == SYS_MOTOR_FAULT || systemStatus == SYS_LEAK_FAULT ||
-      systemStatus == SYS_SCALE_FAULT || systemStatus == SYS_TIMEOUT_FAULT || faultFlag) {
-    buildResult(RC_FAIL, seq);
+  if (hasFault && opcode != OP_CLEAR) {
+    buildResult(RC_FAIL, seq, faultToApiError(systemStatus));
     return;
   }
 
   switch (opcode) {
     case OP_STATUS: {
-      // Just report current status
-      buildResult(RC_ALL_OK, seq);
+      // Always return OK + current status (IDLE/ACTIVE/FAULT...)
+      buildResult(RC_OK, seq, AE_NONE);
     } break;
 
     case OP_CLEAR: {
       clearSystem();
-      buildResult(RC_ALL_OK, seq);
-    } break;
-
-    case OP_LIST: {
-      uint16_t mMask, sLo, sHi;
-      buildListMasks(mMask, sLo, sHi);
-      // Fill result now
-      buildResult(RC_ALL_OK, seq);
-      regWrite(0x0108, mMask);
-      regWrite(0x0109, sLo);
-      regWrite(0x010A, sHi);
+      buildResult(RC_OK, seq, AE_NONE);
     } break;
 
     case OP_RINSE: {
       if (state == ST_DISPENSING || diagTriggerActive) {
-        buildResult(RC_BUSY, seq);
+        buildResult(RC_FAIL, seq, AE_BUSY);
         break;
       }
       uint16_t seconds_x10 = regRead(0x0002);
@@ -985,11 +979,10 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       unsigned long t0 = millis();
       while (rinseActive) {
         pumpCore();
-        // avoid watchdog issues on host
         delay(1);
       }
       // success
-      buildResult(RC_ALL_OK, seq);
+      buildResult(RC_OK, seq, AE_NONE);
       // elapsed
       uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100); // ~0.1s units
       regWrite(0x0105, elap_x10);
@@ -997,20 +990,20 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
 
     case OP_TRIGGER: {
       if (state == ST_DISPENSING || rinseActive) {
-        buildResult(RC_BUSY, seq);
+        buildResult(RC_FAIL, seq, AE_BUSY);
         break;
       }
       uint16_t motorId = regRead(0x0002);
       uint16_t seconds_x10 = regRead(0x0003);
       int pin; const char* nm;
       if (!motorIdToPinName(motorId, pin, nm)) {
-        buildResult(RC_BAD_ARGS, seq);
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
         break;
       }
       float secs = seconds_x10 / 10.0f;
       startDiagTrigger((uint8_t)pin, secs);
       if (!diagTriggerActive) { // rejected by guards
-        buildResult((faultFlag ? RC_FAIL : RC_BAD_ARGS), seq);
+        buildResult(RC_FAIL, seq, (systemStatus==SYS_ACTIVE ? AE_BUSY : AE_BAD_ARGS));
         break;
       }
       unsigned long t0 = millis();
@@ -1018,29 +1011,29 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
         pumpCore();
         delay(1);
       }
-      buildResult(RC_ALL_OK, seq);
+      buildResult(RC_OK, seq, AE_NONE);
       uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100);
       regWrite(0x0105, elap_x10);
     } break;
 
     case OP_DISPENSE: {
       if (state == ST_DISPENSING || diagTriggerActive) {
-        buildResult(RC_BUSY, seq);
+        buildResult(RC_FAIL, seq, AE_BUSY);
         break;
       }
-      uint16_t motorId = regRead(0x0002);
-      uint16_t tgt_x10 = regRead(0x0003);
-      uint16_t slowOff_x10 = regRead(0x0004);
-      uint16_t softOff_x10 = regRead(0x0005);
-      uint16_t timeout_s   = regRead(0x0006);
+      uint16_t motorId      = regRead(0x0002);
+      uint16_t tgt_x10      = regRead(0x0003);
+      uint16_t slowOff_x10  = regRead(0x0004);
+      uint16_t softOff_x10  = regRead(0x0005);
+      uint16_t timeout_s    = regRead(0x0006);
 
       int pin; const char* nm;
       if (!motorIdToPinName(motorId, pin, nm)) {
-        buildResult(RC_BAD_ARGS, seq);
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
         break;
       }
 
-      // Convert to floats (existing API uses grams/sec floats)
+      // Convert to floats (existing control uses grams/sec floats)
       float slow_g = slowOff_x10 / 10.0f;
       float soft_g = softOff_x10 / 10.0f;
 
@@ -1048,8 +1041,8 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       startDispense(pin, nm, slow_g, soft_g, timeout_s, tgt_x10);
       if (state != ST_DISPENSING && systemStatus != SYS_ACTIVE) {
         // could have refused due to scale fault at start
-        if (systemStatus == SYS_SCALE_FAULT || faultFlag) {
-          buildResult(RC_FAIL, seq);
+        if (systemStatus == SYS_SCALE_FAULT) {
+          buildResult(RC_FAIL, seq, AE_SCALE);
           break;
         }
       }
@@ -1060,9 +1053,12 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       }
       // Finalize result
       if (systemStatus == SYS_IDLE && state == ST_COMPLETE && !faultFlag) {
-        buildResult(RC_ALL_OK, seq);
+        buildResult(RC_OK, seq, AE_NONE);
       } else {
-        buildResult(RC_FAIL, seq);
+        // Map failure to specific error from current status
+        uint16_t err = faultToApiError(systemStatus);
+        if (err == AE_NONE) err = AE_INVALID_CMD; // fallback (shouldn't happen)
+        buildResult(RC_FAIL, seq, err);
       }
       // elapsed since dispense started if available, else since call
       unsigned long used = (startMs ? (millis()-startMs) : (millis()-t0));
@@ -1072,26 +1068,17 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
     } break;
 
     default:
-      buildResult(RC_BAD_FUNC, seq);
+      // Unsupported opcode on Modbus API surface
+      buildResult(RC_FAIL, seq, AE_INVALID_CMD);
       break;
   }
-}
-
-// Fill standard result block @0x0100
-static void buildResult(uint16_t rc, uint16_t seq) {
-  regWrite(0x0100, rc);
-  regWrite(0x0101, faultToApiFault(systemStatus));
-  regWrite(0x0102, (uint16_t)systemStatus);
-  regWrite(0x0103, seq);
-  regWrite(0x0104, lastWeight_x10);
-  regWrite(0x0106, activeScaleId());
 }
 
 // Core Modbus 0x17 handler (single transaction)
 static void handleModbus() {
   if (apiBusy) return; // executing previous command
 
-  // We need at least the fixed header to know expected length
+  // Need at least the fixed header to know expected length
   if (MODBUS_SERIAL.available() < 12) return;
 
   // Read first 12 bytes
@@ -1104,23 +1091,19 @@ static void handleModbus() {
 
   uint8_t addr = hdr[0];
   uint8_t func = hdr[1];
-  if (!(addr == MODBUS_SLAVE_ID)) {
-    // Not for us: flush rest of frame by timing out quickly
-    // (We don’t know exact len without parsing; just drop)
+  if (addr != MODBUS_SLAVE_ID) {
+    // Not for us; drop
     return;
   }
 
   if (func != 0x17) {
-    // Read remaining (unknown) and send exception
-    // We will respond immediately with exception (no body)
+    // Respond with Modbus exception (Illegal Function)
     uint8_t resp[5];
-    resp[0]=addr; resp[1]=func|0x80; resp[2]=0x01; // Illegal Function
+    resp[0]=addr; resp[1]=func|0x80; resp[2]=0x01;
     uint16_t crc = mb_crc16(resp,3);
     resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
-    rs485TxMode();
-    MODBUS_SERIAL.write(resp,5);
-    MODBUS_SERIAL.flush();
-    rs485RxMode();
+    delayMicroseconds(MB_T3P5_US); // leave bus idle a frame gap before replying
+    rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
     return;
   }
 
@@ -1137,13 +1120,14 @@ static void handleModbus() {
     resp[0]=addr; resp[1]=func|0x80; resp[2]=0x03;
     uint16_t crc = mb_crc16(resp,3);
     resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
+    delayMicroseconds(MB_T3P5_US); // leave bus idle a frame gap before replying
     rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
     return;
   }
 
   // Compute total length: 1+1 + 2+2 + 2+2 +1 + writeBytes + 2(CRC)
   uint16_t totalLen = 13 + writeBytes;
-  // We already consumed 12, need to read the rest
+  // Already consumed 12, need to read the rest
   while (MODBUS_SERIAL.available() < (totalLen - 12)) { /* wait */ }
 
   // Read remaining
@@ -1173,25 +1157,16 @@ static void handleModbus() {
     regWrite(writeStart + i, val);
   }
 
-  // If busy with a current command, reply BUSY immediately
-  if (apiBusy) {
-    // Build BUSY result (latched area)
-    regWrite(0x0100, RC_BUSY);
-    regWrite(0x0101, faultToApiFault(systemStatus));
-    regWrite(0x0102, (uint16_t)systemStatus);
-    regWrite(0x0103, regRead(0x0001));
+  // If action currently running, declare BUSY (API-style FAIL+BUSY)
+  if (state == ST_DISPENSING || rinseActive || diagTriggerActive) {
+    uint16_t seq = regRead(0x0001);
+    buildResult(RC_FAIL, seq, AE_BUSY);
   } else {
     // Execute the command synchronously
     apiBusy = true;
     uint16_t opcode = regRead(0x0000);
     uint16_t seq    = regRead(0x0001);
-
-    // If currently running something (dispense/rinse/trigger), declare BUSY
-    if (state == ST_DISPENSING || rinseActive || diagTriggerActive) {
-      buildResult(RC_BUSY, seq);
-    } else {
-      executeOpcode(opcode, seq);
-    }
+    executeOpcode(opcode, seq);
     apiBusy = false;
   }
 
