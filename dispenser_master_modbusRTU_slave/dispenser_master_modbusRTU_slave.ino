@@ -1,82 +1,58 @@
 /*
-  Mega 2560 — One-Shot Dispenser + Leak Monitor + Modbus RTU
-  API style: Only STATUS, CLEAR, DISPENSE, RINSE, TRIGGER exposed via Modbus
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │ Motor Controller Firmware — One-Shot Dispenser + Modbus RTU + Fail Handling  │
+  │ Target MCU: Arduino Mega 2560                                                │
+  └──────────────────────────────────────────────────────────────────────────────┘
 
-  ==================== Modbus RTU Slave API (single-shot) ====================
-  Wiring & link:
-    - RS485 DE  -> A2 (RS485_DE_PIN)
-    - RS485 RE  -> A3 (RS485_RE_PIN)  [active-low receiver enable]
-    - Bus port  -> Serial3 @ 19200 8N1
-    - Slave ID  -> 1
+  Version : 1.0
+  Date    : 2025-10-10  (Asia/Riyadh)
+  Authors : Erdie Gange · ChatGPT 5
 
-  Wire-level function code:
-    - Only **0x17 Read/Write Multiple Registers** is accepted.
-      Any other Modbus function code returns Exception 0x01 (Illegal Function).
+  What this firmware does
+  ───────────────────────
+  • Single-shot dispense controller with leak monitoring and a Modbus RTU slave API.
+  • Exposes minimalist API: STATUS, CLEAR, DISPENSE, RINSE, TRIGGER.
+  • Accepts only Modbus Function 0x17 (Read/Write Multiple Registers).
+  • Single-transaction model: master writes Command Block and reads Result Block
+    in the same 0x17 frame; the command is executed to completion for that reply.
 
-  Transaction model (single-shot):
-    - Master writes a Command Block and requests a read of the Result Block
-      in the **same** 0x17 transaction.
-    - Slave executes the command to completion (or until it fails), then fills
-      the Result Block for that same response (set a generous master timeout).
+  Modbus RTU (wiring & link)
+  ──────────────────────────
+  • RS485 DE → A2, RS485 RE → A3 (receiver enable is active-LOW).
+  • Bus: Serial3 @ 19200 8N1, Slave ID = 1.
 
-  Register map (Holding registers, 16-bit big-endian per Modbus):
-    Command Block @ 0x0000
-      0x0000  opcode:
-                1=STATUS, 2=CLEAR, 10=DISPENSE, 11=RINSE, 12=TRIGGER
-      0x0001  seq (echoed back)
-      0x0002  arg0
-      0x0003  arg1
-      0x0004  arg2
-      0x0006  arg4
-      0x0007  arg5
+  Register map (Holding registers, 16-bit big-endian per Modbus)
+  ──────────────────────────────────────────────────────────────
+   Command Block @ 0x0000
+     0x0000 opcode: 1=STATUS, 2=CLEAR, 10=DISPENSE, 11=RINSE, 12=TRIGGER
+     0x0001 seq (echo)
+     0x0002..0x0007 args (per opcode)
+   Result Block  @ 0x0100
+     0x0100 resultCode: 0=OK, 1=FAIL
+     0x0101 errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD
+     0x0102 systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT
+     0x0103 seq (echo)
+     0x0104 lastWeight_x10
+     0x0105 elapsed_s_x10
+     0x0106 activeScaleId (1=MILK, 2=SAUCE)
+     0x0107..0x010A reserved (0)
 
-    Result Block @ 0x0100  (API-style minimalist outcome)
-      0x0100  resultCode: 0=OK, 1=FAIL
-      0x0101  errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD
-      0x0102  systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT
-      0x0103  seq (echo)
-      0x0104  aux0 = lastWeight_x10         (optional convenience)
-      0x0105  aux1 = elapsed_s_x10          (if applicable)
-      0x0106  aux2 = activeScaleId (1=MILK,2=SAUCE)
-      0x0107  aux3 = reserved (0)
-      0x0108  0 (unused)
-      0x0109  0 (unused)
-      0x010A  0 (unused)
+  Hardware
+  ────────
+  • Motor outputs: Milk pins 2..9; Sauce pins 10,11,12,25..47 (odd).
+  • Speed select: PIN_SPEEDSEL=LOW → 24V (High speed); HIGH → 12V (Low speed).
+  • Rinse solenoid on pin 49; Motor fault input on pin 51 (ACTIVE-LOW).
+  • Leak sensors: LMV331 channels (A5/A6), (A8/A9).
+  • Scales on I²C: Milk = 0x2A, Sauce = 0x2B (*shop standard: 0x2B for Sauces, 0x2A for Milks*).
 
-  Args by opcode:
-    DISPENSE (10):
-      arg0 = motorId: Milk1..8 => 1..8; Sauce1..15 => 101..115
-      arg1 = target_x10 (e.g., 20 g -> 200)
-      arg2 = slowOffset_x10 (e.g., 15 g -> 150)  // low speed at target - slowOffset
-      arg3 = softCutOffset_x10 (e.g., 1.5 g -> 15) // motor OFF at target - softCutOffset, then coast
-      arg4 = timeout_s
-    RINSE (11):
-      arg0 = seconds_x10 (e.g., 3.5 s -> 35)
-    TRIGGER (12):
-      arg0 = motorId (same mapping as dispense)
-      arg1 = seconds_x10
-
-  API behavior:
-    - Only commands above are handled via Modbus. No LIST or other diagnostics via Modbus.
-    - STATUS always returns current status (OK + systemStatus).
-    - CLEAR clears latched faults; returns OK.
-    - If a command is already in progress, any new command returns FAIL + errorCode=BUSY.
-    - If the system is faulted on receipt (and command ≠ CLEAR), return FAIL + errorCode=<fault>.
-    - If arguments are bad, return FAIL + errorCode=BAD_ARGS.
-    - If opcode unsupported, return FAIL + errorCode=INVALID_CMD.
-
-  Dispense control logic (unchanged semantics):
-    - Switch to LOW speed at (target − slowOffset_g).
-    - Motor OFF at (target − softCutOffset_g), settle, then coast (no top-off).
-    - Timeouts, motor/leak/scale faults handled with existing debounce logic.
-
-  Serial CLI (diagnostics/bench only; not exposed via Modbus):
-    help, list, status, clear,
-    dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>,
-    rinse <seconds>,
-    trigger <motor> <seconds>
+  Notes
+  ─────
+  • Dispense control: switch to LOW at (target − slowOffset), OFF at (target − softCutOffset),
+    then settle & coast (no top-off). Faults/timeouts enforce existing debounce logic.
+  • Serial CLI is for bench/diagnostics only; Modbus API remains minimal by design.
 */
 
+#include <Arduino.h>
 #include <Wire.h>
 #include <string.h>
 #include <math.h>
@@ -123,8 +99,8 @@ const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD; // ~573 us @19200
 const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0 ms
 
 // ===================== Scale config (variables only) =====================
-const uint8_t MILK_SCALE_ADDR  = 0x2A;
-const uint8_t SAUCE_SCALE_ADDR = 0x2B;
+const uint8_t MILK_SCALE_ADDR  = 0x2A; // Milk scale address
+const uint8_t SAUCE_SCALE_ADDR = 0x2B; // Sauce scale address  (*shop standard: 0x2B Sauces, 0x2A Milks*)
 const uint8_t MILK_SCALE_ID    = 1;
 const uint8_t SAUCE_SCALE_ID   = 2;
 
