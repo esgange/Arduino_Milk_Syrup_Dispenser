@@ -1,20 +1,31 @@
 /*
   ┌──────────────────────────────────────────────────────────────────────────────┐
-  │ Motor Controller Firmware — One-Shot Dispenser + Modbus RTU + Fail Handling  │
+  │ Motor Controller Firmware — One-Shot Dispenser + Modbus RTU + Latched Faults │
   │ Target MCU: Arduino Mega 2560                                                │
   └──────────────────────────────────────────────────────────────────────────────┘
 
-  Version : 1.0
-  Date    : 2025-10-10  (Asia/Riyadh)
+  Version : 1.1
+  Date    : 2025-10-12  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
   What this firmware does
   ───────────────────────
   • Single-shot dispense controller with leak monitoring and a Modbus RTU slave API.
-  • Exposes minimalist API: STATUS, CLEAR, DISPENSE, RINSE, TRIGGER.
+  • Exposes minimalist API: STATUS, CLEAR, ABORT, DISPENSE, RINSE, TRIGGER.
   • Accepts only Modbus Function 0x17 (Read/Write Multiple Registers).
   • Single-transaction model: master writes Command Block and reads Result Block
     in the same 0x17 frame; the command is executed to completion for that reply.
+
+  Important behavior changes in v1.1
+  ───────────────────────────────────
+  • All faults are now **latched**: LEAK, SCALE, MOTOR, TIMEOUT remain latched until an
+    explicit CLEAR (OP_CLEAR) command is received.
+  • New command **ABORT (OP_ABORT=3)**: immediately stops any current action, makes outputs
+    safe, and latches a new fault state **SYS_ABORTED_FAULT** (cleared only by CLEAR).
+  • Modbus caveat: Because 0x17 executes synchronously to completion, the master cannot send
+    another frame (like ABORT) until the current reply is sent. ABORT therefore cannot interrupt
+    a command *within the same transaction*. It will preempt future commands and can serve as
+    a software E-stop state.
 
   Modbus RTU (wiring & link)
   ──────────────────────────
@@ -24,13 +35,13 @@
   Register map (Holding registers, 16-bit big-endian per Modbus)
   ──────────────────────────────────────────────────────────────
    Command Block @ 0x0000
-     0x0000 opcode: 1=STATUS, 2=CLEAR, 10=DISPENSE, 11=RINSE, 12=TRIGGER
+     0x0000 opcode: 1=STATUS, 2=CLEAR, 3=ABORT, 10=DISPENSE, 11=RINSE, 12=TRIGGER
      0x0001 seq (echo)
      0x0002..0x0007 args (per opcode)
    Result Block  @ 0x0100
      0x0100 resultCode: 0=OK, 1=FAIL
-     0x0101 errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD
-     0x0102 systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT
+     0x0101 errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD,8=ABORTED
+     0x0102 systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT,6=ABORTED_FAULT
      0x0103 seq (echo)
      0x0104 lastWeight_x10
      0x0105 elapsed_s_x10
@@ -58,7 +69,7 @@
 #include <math.h>
 
 // ===================== Compile-time / timing =====================
-#define FAULT_DETECT_ENABLED 1   // 1=enforce faults; 0=ignore motor/leak/scale faults
+#define FAULT_DETECT_ENABLED 1   // 1=enforce faults
 
 const unsigned long FAULT_DEBOUNCE_MS = 1000;
 const unsigned long LEAK_SAMPLE_MS    = 1000;
@@ -79,11 +90,11 @@ enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 
 // API error codes (details when RC_FAIL)
 enum ApiError : uint16_t {
-  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7
+  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7, AE_ABORTED=8
 };
 
 // Opcodes exposed on Modbus
-enum Opcode : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
+enum Opcode : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_ABORT=3, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
 
 // Busy flag to serialize API calls
 volatile bool apiBusy = false;
@@ -193,7 +204,8 @@ enum SystemStatus : uint8_t {
   SYS_MOTOR_FAULT=2,
   SYS_LEAK_FAULT=3,
   SYS_SCALE_FAULT=4,
-  SYS_TIMEOUT_FAULT=5
+  SYS_TIMEOUT_FAULT=5,
+  SYS_ABORTED_FAULT=6
 };
 volatile SystemStatus systemStatus = SYS_IDLE;
 
@@ -212,6 +224,7 @@ const __FlashStringHelper* systemStatusStr() {
     case SYS_LEAK_FAULT:     return F("LEAK FAULT");
     case SYS_SCALE_FAULT:    return F("SCALE FAULT");
     case SYS_TIMEOUT_FAULT:  return F("DISPENSE TIMEOUT FAULT");
+    case SYS_ABORTED_FAULT:  return F("ABORTED");
     default:                 return F("UNKNOWN");
   }
 }
@@ -244,11 +257,7 @@ void startActiveMotor(){ if (activeMotorPin >= 0) digitalWrite(activeMotorPin, H
 // ----------- Scale I/O (auto-routed to active scale) -----------
 bool readScaleOnce(uint16_t& w_x10) {
   if (Wire.requestFrom((int)activeScaleAddr(), 3) == 3) {
-#if FAULT_DETECT_ENABLED
-    if (systemStatus == SYS_SCALE_FAULT) {
-      systemStatus = (state == ST_DISPENSING) ? SYS_ACTIVE : SYS_IDLE;
-    }
-#endif
+    // No auto-clear of SCALE fault anymore (latched until CLEAR)
     (void)Wire.read();
     uint8_t lo = Wire.read();
     uint8_t hi = Wire.read();
@@ -262,8 +271,6 @@ bool readScaleOnce(uint16_t& w_x10) {
 #if FAULT_DETECT_ENABLED
       if (state == ST_DISPENSING) logEvent(F("SCALE_FAULT_ABORT"));
       else                        logEvent(F("SCALE_FAULT"));
-#else
-      logEvent(F("SCALE_FAULT"));
 #endif
       scaleFaultLogged = true;
     }
@@ -323,7 +330,7 @@ void logEvent(const __FlashStringHelper* label) {
   Serial.print(F(" [scale=")); Serial.print(activeScaleName()); Serial.print(F(" id=")); Serial.print(activeScaleId());
   Serial.print(F(" addr=0x")); Serial.print(activeScaleAddr(), HEX); Serial.print(F("]"));
   Serial.print(F(" w=")); Serial.print(lastWeight_x10/10.0f,1);
-  Serial.print(F(" g, t=")); Serial.print((millis()-startMs)/1000.0f,3);
+  Serial.print(F(" g, t=")); Serial.print((startMs ? (millis()-startMs)/1000.0f : 0.0f),3);
   Serial.println(F(" s"));
 }
 
@@ -346,8 +353,6 @@ void sampleLeaksIfDue() {
 #if FAULT_DETECT_ENABLED
         if (state == ST_DISPENSING) logEvent(F("LEAK_FAULT_ABORT"));
         else                        logEvent(F("LEAK_FAULT"));
-#else
-        logEvent(F("LEAK_FAULT"));
 #endif
         leakFaultLogged = true;
       }
@@ -364,10 +369,8 @@ void sampleLeaksIfDue() {
 #endif
     }
   } else {
+    // No auto-clear of leak faults anymore (latched until CLEAR)
     leakStartMs = 0;
-    if ((state == ST_IDLE || state == ST_COMPLETE) && systemStatus == SYS_LEAK_FAULT) {
-      systemStatus = SYS_IDLE;
-    }
   }
 }
 
@@ -553,7 +556,7 @@ void handleDispensing() {
     if (lastWeight_x10 >= target_x10) {
       stopActiveMotor();
       allOutputsSafe();
-      systemStatus = SYS_IDLE;
+      systemStatus = SYS_IDLE;  // end of dispense is not a fault
       logEvent(F("DONE_HARDCUT"));
       state = ST_COMPLETE;
       return;
@@ -641,6 +644,36 @@ void handleDiagTriggerTimer() {
   }
 }
 
+// ===================== ABORT logic (latched) =====================
+void abortNow() {
+  // Stop everything and latch ABORTED fault
+  stopActiveMotor();
+  allOutputsSafe();
+
+  // cancel rinse
+  rinseActive = false; rinseEndMs = 0;
+
+  // cancel diag trigger
+  if (diagTriggerActive) {
+    digitalWrite(diagTriggerPin, LOW);
+    if (diagRevertToInput) pinMode(diagTriggerPin, INPUT);
+    diagTriggerActive = false;
+    diagTriggerPin = 255;
+    diagTriggerEndMs = 0;
+    diagRevertToInput = false;
+  }
+
+  // teardown dispense state
+  state = ST_IDLE;
+  motorStartPending = false;
+  motorStartDueMs = 0;
+
+  systemStatus = SYS_ABORTED_FAULT;
+  faultFlag = true;
+
+  logEvent(F("ABORTED"));
+}
+
 // ===================== Clear system =====================
 void clearSystem() {
   stopActiveMotor();
@@ -676,7 +709,9 @@ void clearSystem() {
   lastWeightSauce_x10 = 0;
   activeScale = SCALE_MILK;
 
+  // stop rinse
   rinseActive = false; rinseEndMs = 0;
+  // stop diag trigger
   if (diagTriggerActive) {
     digitalWrite(diagTriggerPin, LOW);
     if (diagRevertToInput) pinMode(diagTriggerPin, INPUT);
@@ -727,7 +762,7 @@ void setup() {
   rs485RxMode();
   MODBUS_SERIAL.begin(MODBUS_BAUD);
 
-  Serial.println(F("Mega One-Shot Dispenser + Leak Monitor + Modbus RTU ready. Type 'help'."));
+  Serial.println(F("Mega One-Shot Dispenser + Leak Monitor + Modbus RTU (latched faults + ABORT) ready. Type 'help'."));
 }
 
 static inline void pumpCore() {
@@ -746,6 +781,7 @@ void loop() {
 
   // Serial CLI (bench/diagnostics only; Modbus API excludes these extras)
   static String line;
+  // We keep CLI disabled while apiBusy to avoid interfering with a synchronous Modbus execution.
   if (!apiBusy) {
     while (Serial.available()) {
       char c = (char)Serial.read();
@@ -761,6 +797,7 @@ void loop() {
             Serial.println(F("  list"));
             Serial.println(F("  status"));
             Serial.println(F("  clear"));
+            Serial.println(F("  abort"));
             Serial.println(F("  dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>"));
             Serial.println(F("  rinse <seconds>"));
             Serial.println(F("  trigger <motor> <seconds>"));
@@ -773,6 +810,9 @@ void loop() {
           }
           else if (lower == "clear") {
             clearSystem();
+          }
+          else if (lower == "abort") {
+            abortNow();
           }
           else if (lower.startsWith("rinse ")) {
             String s = cmd.substring(6); s.trim();
@@ -884,6 +924,7 @@ static uint16_t faultToApiError(uint8_t st) {
     case SYS_LEAK_FAULT:    return AE_LEAK;
     case SYS_SCALE_FAULT:   return AE_SCALE;
     case SYS_TIMEOUT_FAULT: return AE_TIMEOUT;
+    case SYS_ABORTED_FAULT: return AE_ABORTED;
     default: return AE_NONE;
   }
 }
@@ -920,14 +961,15 @@ static bool motorIdToPinName(uint16_t motorId, int &pin, const char* &nm) {
 
 // Blocking executor: conforms to API-style OK/FAIL + errorCode
 static void executeOpcode(uint16_t opcode, uint16_t seq) {
-  // If system currently in a fault, only CLEAR is accepted.
+  // If system currently in a fault, only CLEAR or ABORT are accepted.
   bool hasFault =
       (systemStatus == SYS_MOTOR_FAULT) ||
       (systemStatus == SYS_LEAK_FAULT)  ||
       (systemStatus == SYS_SCALE_FAULT) ||
-      (systemStatus == SYS_TIMEOUT_FAULT);
+      (systemStatus == SYS_TIMEOUT_FAULT) ||
+      (systemStatus == SYS_ABORTED_FAULT);
 
-  if (hasFault && opcode != OP_CLEAR) {
+  if (hasFault && !(opcode == OP_CLEAR || opcode == OP_ABORT)) {
     buildResult(RC_FAIL, seq, faultToApiError(systemStatus));
     return;
   }
@@ -941,6 +983,15 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
     case OP_CLEAR: {
       clearSystem();
       buildResult(RC_OK, seq, AE_NONE);
+    } break;
+
+    case OP_ABORT: {
+      unsigned long t0 = millis();
+      abortNow();
+      // Return FAIL + ABORTED to make it obvious to the master this is a latched-fault condition.
+      buildResult(RC_FAIL, seq, AE_ABORTED);
+      uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100);
+      regWrite(0x0105, elap_x10);
     } break;
 
     case OP_RINSE: {
@@ -1133,15 +1184,21 @@ static void handleModbus() {
     regWrite(writeStart + i, val);
   }
 
-  // If action currently running, declare BUSY (API-style FAIL+BUSY)
+  uint16_t opcode = regRead(0x0000);
+  uint16_t seq    = regRead(0x0001);
+
+  // If action currently running, allow ABORT to preempt BUSY; otherwise reply BUSY
   if (state == ST_DISPENSING || rinseActive || diagTriggerActive) {
-    uint16_t seq = regRead(0x0001);
-    buildResult(RC_FAIL, seq, AE_BUSY);
+    if (opcode == OP_ABORT) {
+      apiBusy = true;
+      executeOpcode(opcode, seq);
+      apiBusy = false;
+    } else {
+      buildResult(RC_FAIL, seq, AE_BUSY);
+    }
   } else {
     // Execute the command synchronously
     apiBusy = true;
-    uint16_t opcode = regRead(0x0000);
-    uint16_t seq    = regRead(0x0001);
     executeOpcode(opcode, seq);
     apiBusy = false;
   }

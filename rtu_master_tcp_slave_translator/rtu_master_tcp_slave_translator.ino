@@ -14,6 +14,10 @@
     rinse <seconds>
     trigger <motorId|name> <seconds>
     dispense <motorId|name> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>
+
+  Notes:
+    • Datalog echo on send: "-> [sent] <CMD> ...".
+    • Sequence counter removed (seq written as 0 to the slave).
 */
 
 #include <Arduino.h>
@@ -33,7 +37,10 @@
 
 // Result decode
 enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
-enum ApiError   : uint16_t { AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7 };
+enum ApiError   : uint16_t {
+  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7,
+  AE_ABORTED=8   // for slave's aborted state label
+};
 enum Opcode     : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
 
 // We always read full result block 0x0100..0x010A (11 regs)
@@ -205,15 +212,16 @@ bool mbReadWriteMultiple(uint8_t slaveId,
 // ---------------------------------------------
 const char* errToStr(uint16_t e) {
   switch (e) {
-    case AE_NONE: return "NONE";
-    case AE_BUSY: return "BUSY";
-    case AE_MOTOR: return "MOTOR_FAULT";
-    case AE_LEAK: return "LEAK_FAULT";
-    case AE_SCALE: return "SCALE_FAULT";
-    case AE_TIMEOUT: return "TIMEOUT_FAULT";
-    case AE_BAD_ARGS: return "BAD_ARGS";
+    case AE_NONE:        return "NONE";
+    case AE_BUSY:        return "BUSY";
+    case AE_MOTOR:       return "MOTOR_FAULT";
+    case AE_LEAK:        return "LEAK_FAULT";
+    case AE_SCALE:       return "SCALE_FAULT";
+    case AE_TIMEOUT:     return "TIMEOUT_FAULT";
+    case AE_BAD_ARGS:    return "BAD_ARGS";
     case AE_INVALID_CMD: return "INVALID_CMD";
-    default: return "?";
+    case AE_ABORTED:     return "ABORTED";
+    default:             return "?";
   }
 }
 
@@ -224,6 +232,7 @@ void printResultRegs(const uint16_t* R) {
   Serial.print(F("result="));
   Serial.print(resultCode==RC_OK ? F("OK") : F("FAIL"));
   Serial.print(F("  error=")); Serial.print(errToStr(errorCode));
+  Serial.println();  // << ensure the next [sent] appears on a new line
 }
 
 // ---------------------------------------------
@@ -253,14 +262,37 @@ bool motorTokenToId(const String& token, uint16_t& outId) {
 }
 
 // ---------------------------------------------
-// API wrappers
+// [sent] datalog echoes (no sequence)
 // ---------------------------------------------
-uint16_t seqCounter = 1;
+static void logSent_STATUS() {
+  Serial.println(F("-------------\n[sent] STATUS."));
+}
+static void logSent_CLEAR() {
+  Serial.println(F("-------------\n[sent] CLEAR."));
+}
+static void logSent_RINSE(float seconds) {
+  Serial.print(F("-------------\n[sent] RINSE seconds=")); Serial.print(seconds, 1); Serial.println(F("."));
+}
+static void logSent_TRIGGER(uint16_t motorId, float seconds) {
+  Serial.print(F("-------------\n[sent] TRIGGER motorId=")); Serial.print(motorId);
+  Serial.print(F(" seconds=")); Serial.print(seconds, 1); Serial.println(F("."));
+}
+static void logSent_DISPENSE(uint16_t motorId, float target_g, float slow_g, float soft_g, uint16_t timeout_s) {
+  Serial.print(F("-------------\n[sent] DISPENSE motorId=")); Serial.print(motorId);
+  Serial.print(F(" target_g=")); Serial.print(target_g, 1);
+  Serial.print(F(" slowOffset_g=")); Serial.print(slow_g, 1);
+  Serial.print(F(" softCutOffset_g=")); Serial.print(soft_g, 1);
+  Serial.print(F(" timeout_s=")); Serial.print(timeout_s); Serial.println(F("."));
+}
 
+// ---------------------------------------------
+// API wrappers  (seq removed; write seq=0)
+// ---------------------------------------------
 bool api_status(uint16_t* outRegs, uint32_t timeoutMs=2000) {
   uint16_t W[8] = {0};
   W[0] = OP_STATUS;
-  W[1] = seqCounter++;
+  W[1] = 0;              // seq=0
+  logSent_STATUS();
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
 }
@@ -268,7 +300,8 @@ bool api_status(uint16_t* outRegs, uint32_t timeoutMs=2000) {
 bool api_clear(uint16_t* outRegs, uint32_t timeoutMs=2000) {
   uint16_t W[8] = {0};
   W[0] = OP_CLEAR;
-  W[1] = seqCounter++;
+  W[1] = 0;              // seq=0
+  logSent_CLEAR();
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
 }
@@ -277,8 +310,9 @@ bool api_rinse(float seconds, uint16_t* outRegs) {
   uint16_t seconds_x10 = (uint16_t)(seconds*10.0f + 0.5f);
   uint16_t W[8] = {0};
   W[0] = OP_RINSE;
-  W[1] = seqCounter++;
+  W[1] = 0;              // seq=0
   W[2] = seconds_x10;
+  logSent_RINSE(seconds);
   uint32_t toMs = (uint32_t)(seconds*1000.0f) + 5000UL;
   if (toMs < 3000) toMs = 3000;
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
@@ -289,9 +323,10 @@ bool api_trigger(uint16_t motorId, float seconds, uint16_t* outRegs) {
   uint16_t seconds_x10 = (uint16_t)(seconds*10.0f + 0.5f);
   uint16_t W[8] = {0};
   W[0] = OP_TRIGGER;
-  W[1] = seqCounter++;
+  W[1] = 0;              // seq=0
   W[2] = motorId;
   W[3] = seconds_x10;
+  logSent_TRIGGER(motorId, seconds);
   uint32_t toMs = (uint32_t)(seconds*1000.0f) + 5000UL;
   if (toMs < 3000) toMs = 3000;
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
@@ -302,12 +337,14 @@ bool api_dispense(uint16_t motorId, float target_g, float slowOffset_g, float so
   auto to_x10 = [](float f)->uint16_t { long v = lroundf(f*10.0f); if (v < 0) v = 0; if (v > 65535) v = 65535; return (uint16_t)v; };
   uint16_t W[8] = {0};
   W[0] = OP_DISPENSE;
-  W[1] = seqCounter++;
+  W[1] = 0;              // seq=0
   W[2] = motorId;
   W[3] = to_x10(target_g);
   W[4] = to_x10(slowOffset_g);
   W[5] = to_x10(softCutOffset_g);
   W[6] = timeout_s;
+
+  logSent_DISPENSE(motorId, target_g, slowOffset_g, softCutOffset_g, timeout_s);
 
   uint32_t toMs = (uint32_t)timeout_s * 1000UL + 10000UL;
   if (toMs < 15000UL) toMs = 15000UL;
@@ -341,14 +378,15 @@ void setup() {
   RS485.begin(BUS_BAUD);     // 8N1 default
   delay(50);
 
-  Serial.println(F("\nNano Every Modbus Master (0x17, names+IDs) ready."));
+  Serial.println(F("\nNano Every Modbus Master ready."));
   printHelp();
 
   // Quick probe
   uint16_t R[RES_QTY] = {0};
-  Serial.print(F("\n[boot] Probing STATUS... "));
+  Serial.print(F("\n[boot] Probing STATUS..."));
+  Serial.print(F("\n"));
   bool ok = api_status(R, 1500);
-  if (ok) { Serial.println(F("OK")); printResultRegs(R); }
+  if (ok) { Serial.println(F("Modbus OK")); printResultRegs(R); }
   else    { Serial.println(F("NO RESPONSE / CRC")); }
 }
 
@@ -370,19 +408,19 @@ void loop() {
       }
       else if (low == "status") {
         ok = api_status(R);
-        Serial.println(ok ? F("\n[status] response:") : F("[status] NO RESPONSE / CRC/timeout"));
+        Serial.println(ok ? F("[status] response:") : F("[status] NO RESPONSE / CRC/timeout"));
         if (ok) printResultRegs(R);
       }
       else if (low == "clear") {
         ok = api_clear(R);
-        Serial.println(ok ? F("\n[clear] response:") : F("[clear] NO RESPONSE / CRC/timeout"));
+        Serial.println(ok ? F("[clear] response:") : F("[clear] NO RESPONSE / CRC/timeout"));
         if (ok) printResultRegs(R);
       }
       else if (low.startsWith("rinse ")) {
         String s = cmd.substring(6); s.trim();
         float secs = s.toFloat();
         ok = api_rinse(secs, R);
-        Serial.println(ok ? F("\n[rinse] response:") : F("[rinse] NO RESPONSE / CRC/timeout"));
+        Serial.println(ok ? F("[rinse] response:") : F("[rinse] NO RESPONSE / CRC/timeout"));
         if (ok) printResultRegs(R);
       }
       else if (low.startsWith("trigger ")) {
@@ -397,7 +435,7 @@ void loop() {
           if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
           float secs = ssec.toFloat();
           ok = api_trigger(motorId, secs, R);
-          Serial.println(ok ? F("\n[trigger] response:") : F("[trigger] NO RESPONSE / CRC/timeout"));
+          Serial.println(ok ? F("[trigger] response:") : F("[trigger] NO RESPONSE / CRC/timeout"));
           if (ok) printResultRegs(R);
         }
       }
@@ -420,7 +458,7 @@ void loop() {
           if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
 
           ok = api_dispense(motorId, target_g, slow_g, soft_g, tout_s, R);
-          Serial.println(ok ? F("\n[dispense] response:") : F("[dispense] NO RESPONSE / CRC/timeout"));
+          Serial.println(ok ? F("[dispense] response:") : F("[dispense] NO RESPONSE / CRC/timeout"));
           if (ok) printResultRegs(R);
         }
       }
