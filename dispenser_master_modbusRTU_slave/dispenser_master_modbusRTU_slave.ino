@@ -4,7 +4,7 @@
   │ Target MCU: Arduino Mega 2560                                                │
   └──────────────────────────────────────────────────────────────────────────────┘
 
-  Version : 1.1
+  Version : 1.1 (non-blocking timed ops)
   Date    : 2025-10-12  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
@@ -13,54 +13,7 @@
   • Single-shot dispense controller with leak monitoring and a Modbus RTU slave API.
   • Exposes minimalist API: STATUS, CLEAR, ABORT, DISPENSE, RINSE, TRIGGER.
   • Accepts only Modbus Function 0x17 (Read/Write Multiple Registers).
-  • Single-transaction model: master writes Command Block and reads Result Block
-    in the same 0x17 frame; the command is executed to completion for that reply.
-
-  Important behavior changes in v1.1
-  ───────────────────────────────────
-  • All faults are now **latched**: LEAK, SCALE, MOTOR, TIMEOUT remain latched until an
-    explicit CLEAR (OP_CLEAR) command is received.
-  • New command **ABORT (OP_ABORT=3)**: immediately stops any current action, makes outputs
-    safe, and latches a new fault state **SYS_ABORTED_FAULT** (cleared only by CLEAR).
-  • Modbus caveat: Because 0x17 executes synchronously to completion, the master cannot send
-    another frame (like ABORT) until the current reply is sent. ABORT therefore cannot interrupt
-    a command *within the same transaction*. It will preempt future commands and can serve as
-    a software E-stop state.
-
-  Modbus RTU (wiring & link)
-  ──────────────────────────
-  • RS485 DE → A2, RS485 RE → A3 (receiver enable is active-LOW).
-  • Bus: Serial3 @ 19200 8N1, Slave ID = 1.
-
-  Register map (Holding registers, 16-bit big-endian per Modbus)
-  ──────────────────────────────────────────────────────────────
-   Command Block @ 0x0000
-     0x0000 opcode: 1=STATUS, 2=CLEAR, 3=ABORT, 10=DISPENSE, 11=RINSE, 12=TRIGGER
-     0x0001 seq (echo)
-     0x0002..0x0007 args (per opcode)
-   Result Block  @ 0x0100
-     0x0100 resultCode: 0=OK, 1=FAIL
-     0x0101 errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD,8=ABORTED
-     0x0102 systemStatus: 0=IDLE,1=ACTIVE,2=MOTOR_FAULT,3=LEAK_FAULT,4=SCALE_FAULT,5=TIMEOUT_FAULT,6=ABORTED_FAULT
-     0x0103 seq (echo)
-     0x0104 lastWeight_x10
-     0x0105 elapsed_s_x10
-     0x0106 activeScaleId (1=MILK, 2=SAUCE)
-     0x0107..0x010A reserved (0)
-
-  Hardware
-  ────────
-  • Motor outputs: Milk pins 2..9; Sauce pins 10,11,12,25..47 (odd).
-  • Speed select: PIN_SPEEDSEL=LOW → 24V (High speed); HIGH → 12V (Low speed).
-  • Rinse solenoid on pin 49; Motor fault input on pin 51 (ACTIVE-LOW).
-  • Leak sensors: LMV331 channels (A5/A6), (A8/A9).
-  • Scales on I²C: Milk = 0x2A, Sauce = 0x2B (*shop standard: 0x2B for Sauces, 0x2A for Milks*).
-
-  Notes
-  ─────
-  • Dispense control: switch to LOW at (target − slowOffset), OFF at (target − softCutOffset),
-    then settle & coast (no top-off). Faults/timeouts enforce existing debounce logic.
-  • Serial CLI is for bench/diagnostics only; Modbus API remains minimal by design.
+  • Single-transaction model; now non-blocking for DISPENSE/RINSE/TRIGGER to allow ABORT.
 */
 
 #include <Arduino.h>
@@ -111,7 +64,7 @@ const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0 ms
 
 // ===================== Scale config (variables only) =====================
 const uint8_t MILK_SCALE_ADDR  = 0x2A; // Milk scale address
-const uint8_t SAUCE_SCALE_ADDR = 0x2B; // Sauce scale address  (*shop standard: 0x2B Sauces, 0x2A Milks*)
+const uint8_t SAUCE_SCALE_ADDR = 0x2B; // Sauce scale address
 const uint8_t MILK_SCALE_ID    = 1;
 const uint8_t SAUCE_SCALE_ID   = 2;
 
@@ -257,7 +210,6 @@ void startActiveMotor(){ if (activeMotorPin >= 0) digitalWrite(activeMotorPin, H
 // ----------- Scale I/O (auto-routed to active scale) -----------
 bool readScaleOnce(uint16_t& w_x10) {
   if (Wire.requestFrom((int)activeScaleAddr(), 3) == 3) {
-    // No auto-clear of SCALE fault anymore (latched until CLEAR)
     (void)Wire.read();
     uint8_t lo = Wire.read();
     uint8_t hi = Wire.read();
@@ -298,7 +250,7 @@ void pollScaleIfDue() {
   }
 }
 
-// Parse motor selector
+// Parse motor selector (CLI helper)
 bool parseMotorSelector(const String& token, int &pinOut, char *nameOut, size_t nameCap) {
   String t = token; t.trim(); t.toLowerCase();
 
@@ -312,7 +264,6 @@ bool parseMotorSelector(const String& token, int &pinOut, char *nameOut, size_t 
   if (t.startsWith("m"))     return pick(t.substring(1).toInt(), MILK_NAMES,  MILK_PINS,  8);
   if (t.startsWith("s"))     return pick(t.substring(1).toInt(), SAUCE_NAMES, SAUCE_PINS, 15);
 
-  // Numeric pin support (CLI only)
   bool numeric = true;
   for (uint16_t i=0;i<t.length();++i) if (!isDigit(t[i])) { numeric=false; break; }
   if (numeric && t.length()>0) {
@@ -327,9 +278,6 @@ bool parseMotorSelector(const String& token, int &pinOut, char *nameOut, size_t 
 void logEvent(const __FlashStringHelper* label) {
   Serial.print(F("[event] "));
   Serial.print(label);
-  Serial.print(F(" [scale=")); Serial.print(activeScaleName()); Serial.print(F(" id=")); Serial.print(activeScaleId());
-  Serial.print(F(" addr=0x")); Serial.print(activeScaleAddr(), HEX); Serial.print(F("]"));
-  Serial.print(F(" w=")); Serial.print(lastWeight_x10/10.0f,1);
   Serial.print(F(" g, t=")); Serial.print((startMs ? (millis()-startMs)/1000.0f : 0.0f),3);
   Serial.println(F(" s"));
 }
@@ -369,7 +317,6 @@ void sampleLeaksIfDue() {
 #endif
     }
   } else {
-    // No auto-clear of leak faults anymore (latched until CLEAR)
     leakStartMs = 0;
   }
 }
@@ -400,14 +347,13 @@ void printList() {
 }
 
 // ===================== Core dispense logic =====================
-//   slowOffset_g      -> switch to LOW speed at target - slowOffset_g
-//   softCutOffset_g   -> stop motor at target - softCutOffset_g (then settle & coast; no top-off)
+// slowOffset_g -> switch to LOW at target - slowOffset_g
+// softCutOffset_g -> stop motor at target - softCutOffset_g (then settle & coast)
 void startDispense(int pin, const char* name, float slowOffset_g, float softCutOffset_g, unsigned long timeout_s, uint16_t tgt_x10) {
   if (timeout_s == 0) timeout_s = 30;
   if (timeout_s*1000UL > MAX_TIMEOUT_MS) timeout_s = MAX_TIMEOUT_MS/1000UL;
   timeout_ms = timeout_s * 1000UL;
 
-  // Clamp offsets to >= 0
   if (slowOffset_g < 0) slowOffset_g = 0;
   if (softCutOffset_g < 0) softCutOffset_g = 0;
 
@@ -433,7 +379,7 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
 
   target_x10 = tgt_x10;
 
-  // Convert offsets to x10 and compute absolute thresholds (clamped to >= 0)
+  // Compute absolute thresholds
   uint16_t slowOff_x10 = (uint16_t)(slowOffset_g * 10.0f + 0.5f);
   uint16_t softOff_x10 = (uint16_t)(softCutOffset_g * 10.0f + 0.5f);
 
@@ -444,7 +390,6 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
   strncpy(activeMotorName, name, sizeof(activeMotorName)-1);
   activeMotorName[sizeof(activeMotorName)-1] = '\0';
 
-  // Always start in HIGH (24V), drop to LOW at lowSpeed_x10
   setSpeedHigh();
   lowSpeedApplied = false;
 
@@ -468,12 +413,10 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
   state = ST_DISPENSING;
   systemStatus = SYS_ACTIVE;
 
-  // Warn if soft-cut will occur before slowing down (offsets reversed)
   if (softThreshold_x10 < lowSpeed_x10) {
     Serial.println(F("[warn] softCutOffset_g > slowOffset_g: soft-cut will occur before slow-down"));
   }
 
-  // Config printout
   Serial.print(F("[cfg][scale=")); Serial.print(activeScaleName()); Serial.print(F(" id=")); Serial.print(activeScaleId());
   Serial.print(F(" addr=0x")); Serial.print(activeScaleAddr(),HEX); Serial.print(F("] slowAt="));
   Serial.print(lowSpeed_x10/10.0f,1); Serial.print(F(" g, "));
@@ -545,14 +488,12 @@ void handleDispensing() {
   }
 
   if (!softCutTriggered) {
-    // Step-down to Low at lowSpeed_x10
     if (!lowSpeedApplied && lastWeight_x10 >= lowSpeed_x10) {
       setSpeedLow();
       lowSpeedApplied = true;
       logEvent(F("SPEED_LOW"));
     }
 
-    // Hard-cut if we reached or exceeded target before soft-cut
     if (lastWeight_x10 >= target_x10) {
       stopActiveMotor();
       allOutputsSafe();
@@ -562,7 +503,6 @@ void handleDispensing() {
       return;
     }
 
-    // Soft-cut stop (pre-cut) at softThreshold_x10
     if (lastWeight_x10 >= softThreshold_x10) {
       stopActiveMotor();
       softCutTriggered = true;
@@ -574,7 +514,6 @@ void handleDispensing() {
     return;
   }
 
-  // After soft-cut: wait settle, then check if coast reached target
   if (now - softStopMs < SETTLE_MS) return;
 
   if (lastWeight_x10 >= target_x10) {
@@ -594,6 +533,7 @@ void startRinseSeconds(float seconds) {
   if (ms > MAX_TIMEOUT_MS) ms = MAX_TIMEOUT_MS;
   digitalWrite(PIN_RINSER, HIGH);
   rinseActive = true;
+  systemStatus = SYS_ACTIVE;
   rinseEndMs = millis() + ms;
   Serial.print(F("[rinse] ON for ")); Serial.print(ms/1000.0f,1); Serial.println(F(" s"));
 }
@@ -604,8 +544,10 @@ void handleRinseTimer() {
     digitalWrite(PIN_RINSER, LOW);
     rinseActive = false;
     Serial.println(F("[rinse] OFF"));
+    if (state != ST_DISPENSING && !diagTriggerActive) systemStatus = SYS_IDLE;
   }
 }
+
 
 // ===================== Diagnostic trigger =====================
 void startDiagTrigger(uint8_t pin, float seconds) {
@@ -626,6 +568,7 @@ void startDiagTrigger(uint8_t pin, float seconds) {
 
   digitalWrite(pin, HIGH);
   diagTriggerActive = true;
+  systemStatus = SYS_ACTIVE;
   diagTriggerPin = pin;
   diagTriggerEndMs = millis() + ms;
 
@@ -641,19 +584,17 @@ void handleDiagTriggerTimer() {
     Serial.print(F("[trigger] pin ")); Serial.print(diagTriggerPin); Serial.println(F(" OFF"));
     diagTriggerActive = false;
     diagTriggerPin = 255;
+    if (state != ST_DISPENSING && !rinseActive) systemStatus = SYS_IDLE;
   }
 }
 
 // ===================== ABORT logic (latched) =====================
 void abortNow() {
-  // Stop everything and latch ABORTED fault
   stopActiveMotor();
   allOutputsSafe();
 
-  // cancel rinse
   rinseActive = false; rinseEndMs = 0;
 
-  // cancel diag trigger
   if (diagTriggerActive) {
     digitalWrite(diagTriggerPin, LOW);
     if (diagRevertToInput) pinMode(diagTriggerPin, INPUT);
@@ -663,7 +604,6 @@ void abortNow() {
     diagRevertToInput = false;
   }
 
-  // teardown dispense state
   state = ST_IDLE;
   motorStartPending = false;
   motorStartDueMs = 0;
@@ -709,9 +649,8 @@ void clearSystem() {
   lastWeightSauce_x10 = 0;
   activeScale = SCALE_MILK;
 
-  // stop rinse
   rinseActive = false; rinseEndMs = 0;
-  // stop diag trigger
+
   if (diagTriggerActive) {
     digitalWrite(diagTriggerPin, LOW);
     if (diagRevertToInput) pinMode(diagTriggerPin, INPUT);
@@ -756,16 +695,15 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
 
-  // RS-485
   pinMode(RS485_DE_PIN, OUTPUT);
   pinMode(RS485_RE_PIN, OUTPUT);
   rs485RxMode();
   MODBUS_SERIAL.begin(MODBUS_BAUD);
 
-  Serial.println(F("Mega One-Shot Dispenser + Leak Monitor + Modbus RTU (latched faults + ABORT) ready. Type 'help'."));
+  Serial.println(F("Mega One-Shot Dispenser + Leak Monitor + Modbus RTU ready. Type 'help'."));
 }
 
-static inline void pumpCore() {
+static inline void pumpCore() { 
   sampleLeaksIfDue();
   handleRinseTimer();
   handleDiagTriggerTimer();
@@ -773,15 +711,10 @@ static inline void pumpCore() {
 }
 
 void loop() {
-  // Modbus (single-shot executor)
   handleModbus();
-
-  // Keep running the normal state machine
   pumpCore();
 
-  // Serial CLI (bench/diagnostics only; Modbus API excludes these extras)
   static String line;
-  // We keep CLI disabled while apiBusy to avoid interfering with a synchronous Modbus execution.
   if (!apiBusy) {
     while (Serial.available()) {
       char c = (char)Serial.read();
@@ -820,7 +753,6 @@ void loop() {
             startRinseSeconds(secs);
           }
           else if (lower.startsWith("trigger ")) {
-            // trigger <motor> <seconds>
             String rest = cmd.substring(8); rest.trim();
             int sp = rest.indexOf(' ');
             if (sp < 0) {
@@ -837,7 +769,6 @@ void loop() {
             }
           }
           else if (lower.startsWith("dispense ")) {
-            // dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>
             if (state == ST_DISPENSING) { Serial.println(F("[busy] already dispensing")); break; }
             if (diagTriggerActive) { Serial.println(F("[blocked] wait for trigger to complete")); break; }
 
@@ -873,8 +804,7 @@ void loop() {
           else {
             Serial.println(F("Unknown command. Type 'help'."));
           }
-
-        } else { /* ignore empty line */ }
+        }
       } else {
         if (line.length() < 120) line += c;
       }
@@ -884,7 +814,6 @@ void loop() {
 
 // ===================== Modbus Helpers & API Executor =====================
 
-// CRC16 (Modbus) poly 0xA001, init 0xFFFF
 static uint16_t mb_crc16(const uint8_t* data, uint16_t len) {
   uint16_t crc = 0xFFFF;
   for (uint16_t pos = 0; pos < len; pos++) {
@@ -929,7 +858,7 @@ static uint16_t faultToApiError(uint8_t st) {
   }
 }
 
-// Fill standard result block @0x0100 (and zero unused)
+// Fill standard result block @0x0100 (elapsed is set by opcodes that care)
 static void buildResult(uint16_t rc, uint16_t seq, uint16_t err) {
   regWrite(0x0100, rc);
   regWrite(0x0101, err);
@@ -959,9 +888,8 @@ static bool motorIdToPinName(uint16_t motorId, int &pin, const char* &nm) {
   return false;
 }
 
-// Blocking executor: conforms to API-style OK/FAIL + errorCode
+// Executor (DISPENSE/RINSE/TRIGGER are non-blocking; ABORT/CLEAR/STATUS immediate)
 static void executeOpcode(uint16_t opcode, uint16_t seq) {
-  // If system currently in a fault, only CLEAR or ABORT are accepted.
   bool hasFault =
       (systemStatus == SYS_MOTOR_FAULT) ||
       (systemStatus == SYS_LEAK_FAULT)  ||
@@ -969,14 +897,13 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       (systemStatus == SYS_TIMEOUT_FAULT) ||
       (systemStatus == SYS_ABORTED_FAULT);
 
-  if (hasFault && !(opcode == OP_CLEAR || opcode == OP_ABORT)) {
+  if (hasFault && !(opcode == OP_CLEAR || opcode == OP_ABORT || opcode == OP_STATUS)) {
     buildResult(RC_FAIL, seq, faultToApiError(systemStatus));
     return;
   }
 
   switch (opcode) {
     case OP_STATUS: {
-      // Always return OK + current status (IDLE/ACTIVE/FAULT...)
       buildResult(RC_OK, seq, AE_NONE);
     } break;
 
@@ -988,7 +915,6 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
     case OP_ABORT: {
       unsigned long t0 = millis();
       abortNow();
-      // Return FAIL + ABORTED to make it obvious to the master this is a latched-fault condition.
       buildResult(RC_FAIL, seq, AE_ABORTED);
       uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100);
       regWrite(0x0105, elap_x10);
@@ -1002,17 +928,11 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       uint16_t seconds_x10 = regRead(0x0002);
       float secs = seconds_x10 / 10.0f;
       startRinseSeconds(secs);
-
-      unsigned long t0 = millis();
-      while (rinseActive) {
-        pumpCore();
-        delay(1);
+      if (!rinseActive) {
+        buildResult(RC_FAIL, seq, AE_BUSY);
+      } else {
+        buildResult(RC_OK, seq, AE_NONE); // will complete asynchronously
       }
-      // success
-      buildResult(RC_OK, seq, AE_NONE);
-      // elapsed
-      uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100); // ~0.1s units
-      regWrite(0x0105, elap_x10);
     } break;
 
     case OP_TRIGGER: {
@@ -1029,18 +949,11 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       }
       float secs = seconds_x10 / 10.0f;
       startDiagTrigger((uint8_t)pin, secs);
-      if (!diagTriggerActive) { // rejected by guards
-        buildResult(RC_FAIL, seq, (systemStatus==SYS_ACTIVE ? AE_BUSY : AE_BAD_ARGS));
-        break;
+      if (!diagTriggerActive) {
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
+      } else {
+        buildResult(RC_OK, seq, AE_NONE); // asynchronous
       }
-      unsigned long t0 = millis();
-      while (diagTriggerActive) {
-        pumpCore();
-        delay(1);
-      }
-      buildResult(RC_OK, seq, AE_NONE);
-      uint16_t elap_x10 = (uint16_t)(((millis()-t0)+50)/100);
-      regWrite(0x0105, elap_x10);
     } break;
 
     case OP_DISPENSE: {
@@ -1060,42 +973,23 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
         break;
       }
 
-      // Convert to floats (existing control uses grams/sec floats)
       float slow_g = slowOff_x10 / 10.0f;
       float soft_g = softOff_x10 / 10.0f;
 
-      // Start and run to completion
       startDispense(pin, nm, slow_g, soft_g, timeout_s, tgt_x10);
-      if (state != ST_DISPENSING && systemStatus != SYS_ACTIVE) {
-        // could have refused due to scale fault at start
-        if (systemStatus == SYS_SCALE_FAULT) {
-          buildResult(RC_FAIL, seq, AE_SCALE);
-          break;
-        }
-      }
-      unsigned long t0 = millis();
-      while (state == ST_DISPENSING) {
-        pumpCore();
-        delay(1);
-      }
-      // Finalize result
-      if (systemStatus == SYS_IDLE && state == ST_COMPLETE && !faultFlag) {
-        buildResult(RC_OK, seq, AE_NONE);
+
+      if (state != ST_DISPENSING && systemStatus == SYS_SCALE_FAULT) {
+        buildResult(RC_FAIL, seq, AE_SCALE);
+      } else if (state == ST_DISPENSING || systemStatus == SYS_ACTIVE) {
+        buildResult(RC_OK, seq, AE_NONE); // accepted; completion via STATUS
       } else {
-        // Map failure to specific error from current status
         uint16_t err = faultToApiError(systemStatus);
-        if (err == AE_NONE) err = AE_INVALID_CMD; // fallback (shouldn't happen)
+        if (err == AE_NONE) err = AE_INVALID_CMD;
         buildResult(RC_FAIL, seq, err);
       }
-      // elapsed since dispense started if available, else since call
-      unsigned long used = (startMs ? (millis()-startMs) : (millis()-t0));
-      uint16_t elap_x10 = (uint16_t)((used + 50)/100);
-      regWrite(0x0105, elap_x10);
-      regWrite(0x0104, lastWeight_x10); // final weight
     } break;
 
     default:
-      // Unsupported opcode on Modbus API surface
       buildResult(RC_FAIL, seq, AE_INVALID_CMD);
       break;
   }
@@ -1103,38 +997,33 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
 
 // Core Modbus 0x17 handler (single transaction)
 static void handleModbus() {
-  if (apiBusy) return; // executing previous command
+  if (apiBusy) return;
 
-  // Need at least the fixed header to know expected length
   if (MODBUS_SERIAL.available() < 12) return;
 
-  // Read first 12 bytes
   uint8_t hdr[12];
   for (uint8_t i=0;i<12;i++) {
     int b = MODBUS_SERIAL.read();
-    if (b < 0) return; // shouldn't happen
+    if (b < 0) return;
     hdr[i] = (uint8_t)b;
   }
 
   uint8_t addr = hdr[0];
   uint8_t func = hdr[1];
   if (addr != MODBUS_SLAVE_ID) {
-    // Not for us; drop
     return;
   }
 
   if (func != 0x17) {
-    // Respond with Modbus exception (Illegal Function)
     uint8_t resp[5];
     resp[0]=addr; resp[1]=func|0x80; resp[2]=0x01;
     uint16_t crc = mb_crc16(resp,3);
     resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
-    delayMicroseconds(MB_T3P5_US); // leave bus idle a frame gap before replying
+    delayMicroseconds(MB_T3P5_US);
     rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
     return;
   }
 
-  // Parse header fields
   uint16_t readStart    = (uint16_t)((hdr[2]<<8) | hdr[3]);
   uint16_t readQty      = (uint16_t)((hdr[4]<<8) | hdr[5]);
   uint16_t writeStart   = (uint16_t)((hdr[6]<<8) | hdr[7]);
@@ -1142,22 +1031,18 @@ static void handleModbus() {
   uint8_t  writeBytes   = hdr[10];
 
   if (writeBytes != (uint8_t)(writeQty*2)) {
-    // Malformed -> exception 0x03 (Illegal Data Value)
     uint8_t resp[5];
     resp[0]=addr; resp[1]=func|0x80; resp[2]=0x03;
     uint16_t crc = mb_crc16(resp,3);
     resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
-    delayMicroseconds(MB_T3P5_US); // leave bus idle a frame gap before replying
+    delayMicroseconds(MB_T3P5_US);
     rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
     return;
   }
 
-  // Compute total length: 1+1 + 2+2 + 2+2 +1 + writeBytes + 2(CRC)
   uint16_t totalLen = 13 + writeBytes;
-  // Already consumed 12, need to read the rest
   while (MODBUS_SERIAL.available() < (totalLen - 12)) { /* wait */ }
 
-  // Read remaining
   const uint16_t restLen = totalLen - 12;
   uint8_t rest[256];
   for (uint16_t i=0;i<restLen;i++) {
@@ -1166,18 +1051,15 @@ static void handleModbus() {
     rest[i] = (uint8_t)b;
   }
 
-  // Verify CRC
   uint8_t full[12+restLen];
   memcpy(full, hdr, 12);
   memcpy(full+12, rest, restLen);
   uint16_t gotCrc = (uint16_t)(full[totalLen-2] | (full[totalLen-1]<<8));
   uint16_t calcCrc = mb_crc16(full, totalLen-2);
   if (gotCrc != calcCrc) {
-    // Bad CRC: ignore silently
     return;
   }
 
-  // Write incoming registers into regSpace
   const uint8_t* writeData = full + 11; // after writeByteCount
   for (uint16_t i=0;i<writeQty;i++) {
     uint16_t val = (uint16_t)((writeData[2*i]<<8) | writeData[2*i+1]);
@@ -1187,9 +1069,14 @@ static void handleModbus() {
   uint16_t opcode = regRead(0x0000);
   uint16_t seq    = regRead(0x0001);
 
-  // If action currently running, allow ABORT to preempt BUSY; otherwise reply BUSY
-  if (state == ST_DISPENSING || rinseActive || diagTriggerActive) {
+  bool busyNow = (state == ST_DISPENSING) || rinseActive || diagTriggerActive;
+
+  if (busyNow) {
     if (opcode == OP_ABORT) {
+      apiBusy = true;
+      executeOpcode(opcode, seq);
+      apiBusy = false;
+    } else if (opcode == OP_STATUS) {
       apiBusy = true;
       executeOpcode(opcode, seq);
       apiBusy = false;
@@ -1197,23 +1084,20 @@ static void handleModbus() {
       buildResult(RC_FAIL, seq, AE_BUSY);
     }
   } else {
-    // Execute the command synchronously
     apiBusy = true;
     executeOpcode(opcode, seq);
     apiBusy = false;
   }
 
-  // Build response: addr, func, readByteCount, readData..., CRC
   const uint16_t respBytes = (uint16_t)(readQty * 2);
   uint16_t outLen = 3 + respBytes + 2;
   uint8_t* resp = (uint8_t*)malloc(outLen);
-  if (!resp) return; // out-of-mem; drop frame
+  if (!resp) return;
 
   resp[0] = addr;
   resp[1] = func;
   resp[2] = (uint8_t)respBytes;
 
-  // Copy out requested holding registers starting at readStart
   for (uint16_t i=0;i<readQty;i++) {
     uint16_t v = regRead(readStart + i);
     resp[3 + 2*i]     = (uint8_t)(v >> 8);

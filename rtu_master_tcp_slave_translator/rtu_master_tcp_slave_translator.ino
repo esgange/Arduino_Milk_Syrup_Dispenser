@@ -4,23 +4,28 @@
   Bus: 19200 8N1, Slave ID = 1
 
   Motor tokens:
-    Milk1..Milk8  (or m1..m8)       -> 1..8
-    Sauce1..Sauce15 (or s1..s15)    -> 101..115
+    Milk1..Milk8   (or m1..m8)       -> 1..8
+    Sauce1..Sauce15 (or s1..s15)     -> 101..115
     Numeric IDs are accepted too.
 
   CLI:
     status
     clear
+    abort
     rinse <seconds>
     trigger <motorId|name> <seconds>
     dispense <motorId|name> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>
 
-  Notes:
-    • Datalog echo on send: "-> [sent] <CMD> ...".
-    • Sequence counter removed (seq written as 0 to the slave).
+  Behavior:
+    • DISPENSE/RINSE/TRIGGER are async on the slave.
+    • Master does NOT block. If a start cmd returns OK+ACTIVE, it records a pending op
+      and silently polls STATUS every ~150 ms until not ACTIVE.
+    • While pending, CLI stays responsive: 'abort' preempts immediately; 'status' prints a snapshot.
+    • One final outcome line per op: "[cmd] done." or "[cmd] ended: <FAULT/ABORTED>".
 */
 
 #include <Arduino.h>
+#include <string.h>
 
 // ---------------- RS485 link ----------------
 #define RS485_EN_PIN 2              // RE/DE tied here (HIGH=TX, LOW=RX)
@@ -38,13 +43,15 @@
 // Result decode
 enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 enum ApiError   : uint16_t {
-  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7,
-  AE_ABORTED=8   // for slave's aborted state label
+  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7, AE_ABORTED=8
 };
-enum Opcode     : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
+enum Opcode     : uint16_t { OP_STATUS=1, OP_CLEAR=2, OP_ABORT=3, OP_DISPENSE=10, OP_RINSE=11, OP_TRIGGER=12 };
 
 // We always read full result block 0x0100..0x010A (11 regs)
 const uint16_t RES_QTY = 0x000B;
+
+// Poll cadence for silent loops
+const uint16_t STATUS_POLL_MS = 150;
 
 // ---- Timing: 3.5 chars (not held while DE is high) ----
 const uint16_t TCHAR_US = (uint16_t)( (11.0 / BUS_BAUD) * 1e6 + 0.5 ); // ~573 us @19200
@@ -78,7 +85,7 @@ void purgeRx() { while (RS485.available()) (void)RS485.read(); }
 
 bool readExact(uint8_t* buf, size_t n, uint32_t deadlineMs) {
   size_t got = 0;
-  while (millis() <= deadlineMs && got < n) {
+  while ((long)(deadlineMs - millis()) >= 0 && got < n) {
     int b = RS485.read();
     if (b >= 0) buf[got++] = (uint8_t)b;
   }
@@ -131,7 +138,6 @@ bool mbReadWriteMultiple(uint8_t slaveId,
   frame[idx++] = (uint8_t)(crc & 0xFF);
   frame[idx++] = (uint8_t)(crc >> 8);
 
-  // Turnaround: purge, idle, TX, immediate DE release, then t3.5 idle
   purgeRx();
   delayMicroseconds(T3P5_US);
 
@@ -208,7 +214,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
 }
 
 // ---------------------------------------------
-// Helpers: printing result
+// Pretty-print helpers (brief: no weight, no scale)
 // ---------------------------------------------
 const char* errToStr(uint16_t e) {
   switch (e) {
@@ -225,19 +231,34 @@ const char* errToStr(uint16_t e) {
   }
 }
 
-void printResultRegs(const uint16_t* R) {
-  uint16_t resultCode = R[0];
-  uint16_t errorCode  = R[1];
+const char* statusToStr(uint16_t s) {
+  switch (s) {
+    case 0: return "IDLE";
+    case 1: return "ACTIVE";
+    case 2: return "MOTOR_FAULT";
+    case 3: return "LEAK_FAULT";
+    case 4: return "SCALE_FAULT";
+    case 5: return "TIMEOUT_FAULT";
+    case 6: return "ABORTED_FAULT";
+    default: return "?";
+  }
+}
+
+// Brief result line (no weight/scale)
+void printResultBrief(const uint16_t* R) {
+  uint16_t resultCode    = R[0];
+  uint16_t errorCode     = R[1];
+  uint16_t systemStatus  = R[2];
 
   Serial.print(F("result="));
   Serial.print(resultCode==RC_OK ? F("OK") : F("FAIL"));
   Serial.print(F("  error=")); Serial.print(errToStr(errorCode));
-  Serial.println();  // << ensure the next [sent] appears on a new line
+  Serial.print(F("  status=")); Serial.print(statusToStr(systemStatus));
+  Serial.println();
 }
 
 // ---------------------------------------------
-// Motor token -> numeric ID mapper
-// Accepts: "sauce2", "s2", "milk1", "m1", or numbers "102", "3"
+// Motor token <-> numeric ID
 // ---------------------------------------------
 bool motorTokenToId(const String& token, uint16_t& outId) {
   String t = token; t.trim();
@@ -261,24 +282,36 @@ bool motorTokenToId(const String& token, uint16_t& outId) {
   return false;
 }
 
-// ---------------------------------------------
-// [sent] datalog echoes (no sequence)
-// ---------------------------------------------
-static void logSent_STATUS() {
-  Serial.println(F("-------------\n[sent] STATUS."));
+// motorId -> "MilkX"/"SauceY"
+void idToName(uint16_t motorId, char* out, size_t cap) {
+  if (motorId >= 1 && motorId <= 8) {
+    snprintf(out, cap, "Milk%u", (unsigned)motorId);
+  } else if (motorId >= 101 && motorId <= 115) {
+    snprintf(out, cap, "Sauce%u", (unsigned)(motorId - 100));
+  } else {
+    snprintf(out, cap, "ID%u", (unsigned)motorId);
+  }
 }
-static void logSent_CLEAR() {
-  Serial.println(F("-------------\n[sent] CLEAR."));
-}
+
+// ---------------------------------------------
+// [sent] datalog echoes (use motor NAME, not numeric ID)
+// ---------------------------------------------
+static void logSent_STATUS() { Serial.println(F("-------------\n[sent] STATUS.")); }
+static void logSent_CLEAR()  { Serial.println(F("-------------\n[sent] CLEAR.")); }
+static void logSent_ABORT()  { Serial.println(F("-------------\n[sent] ABORT.")); }
 static void logSent_RINSE(float seconds) {
   Serial.print(F("-------------\n[sent] RINSE seconds=")); Serial.print(seconds, 1); Serial.println(F("."));
 }
 static void logSent_TRIGGER(uint16_t motorId, float seconds) {
-  Serial.print(F("-------------\n[sent] TRIGGER motorId=")); Serial.print(motorId);
+  char name[16]; idToName(motorId, name, sizeof(name));
+  Serial.print(F("-------------\n[sent] TRIGGER motor="));
+  Serial.print(name);
   Serial.print(F(" seconds=")); Serial.print(seconds, 1); Serial.println(F("."));
 }
 static void logSent_DISPENSE(uint16_t motorId, float target_g, float slow_g, float soft_g, uint16_t timeout_s) {
-  Serial.print(F("-------------\n[sent] DISPENSE motorId=")); Serial.print(motorId);
+  char name[16]; idToName(motorId, name, sizeof(name));
+  Serial.print(F("-------------\n[sent] DISPENSE motor="));
+  Serial.print(name);
   Serial.print(F(" target_g=")); Serial.print(target_g, 1);
   Serial.print(F(" slowOffset_g=")); Serial.print(slow_g, 1);
   Serial.print(F(" softCutOffset_g=")); Serial.print(soft_g, 1);
@@ -286,15 +319,20 @@ static void logSent_DISPENSE(uint16_t motorId, float target_g, float slow_g, flo
 }
 
 // ---------------------------------------------
-// API wrappers  (seq removed; write seq=0)
+// API wrappers  (seq not used; write seq=0)
 // ---------------------------------------------
-bool api_status(uint16_t* outRegs, uint32_t timeoutMs=2000) {
+bool api_status(uint16_t* outRegs, uint32_t timeoutMs=600) {
   uint16_t W[8] = {0};
   W[0] = OP_STATUS;
   W[1] = 0;              // seq=0
-  logSent_STATUS();
+  // caller chooses whether to log [sent] STATUS
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
+}
+
+bool api_status_logged(uint16_t* outRegs, uint32_t timeoutMs=2000) {
+  logSent_STATUS();
+  return api_status(outRegs, timeoutMs);
 }
 
 bool api_clear(uint16_t* outRegs, uint32_t timeoutMs=2000) {
@@ -306,6 +344,15 @@ bool api_clear(uint16_t* outRegs, uint32_t timeoutMs=2000) {
                              REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
 }
 
+bool api_abort(uint16_t* outRegs, uint32_t timeoutMs=800) {
+  uint16_t W[8] = {0};
+  W[0] = OP_ABORT;
+  W[1] = 0;
+  logSent_ABORT();
+  return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
+                             REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
+}
+
 bool api_rinse(float seconds, uint16_t* outRegs) {
   uint16_t seconds_x10 = (uint16_t)(seconds*10.0f + 0.5f);
   uint16_t W[8] = {0};
@@ -313,8 +360,7 @@ bool api_rinse(float seconds, uint16_t* outRegs) {
   W[1] = 0;              // seq=0
   W[2] = seconds_x10;
   logSent_RINSE(seconds);
-  uint32_t toMs = (uint32_t)(seconds*1000.0f) + 5000UL;
-  if (toMs < 3000) toMs = 3000;
+  uint32_t toMs = 2000; // quick acceptance
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 3, outRegs, RES_QTY, toMs);
 }
@@ -327,14 +373,13 @@ bool api_trigger(uint16_t motorId, float seconds, uint16_t* outRegs) {
   W[2] = motorId;
   W[3] = seconds_x10;
   logSent_TRIGGER(motorId, seconds);
-  uint32_t toMs = (uint32_t)(seconds*1000.0f) + 5000UL;
-  if (toMs < 3000) toMs = 3000;
+  uint32_t toMs = 2000; // quick acceptance
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 4, outRegs, RES_QTY, toMs);
 }
 
 bool api_dispense(uint16_t motorId, float target_g, float slowOffset_g, float softCutOffset_g, uint16_t timeout_s, uint16_t* outRegs) {
-  auto to_x10 = [](float f)->uint16_t { long v = lroundf(f*10.0f); if (v < 0) v = 0; if (v > 65535) v = 65535; return (uint16_t)v; };
+  auto to_x10 = [](float f)->uint16_t { long v = (long)(f*10.0f + 0.5f); if (v < 0) v = 0; if (v > 65535) v = 65535; return (uint16_t)v; };
   uint16_t W[8] = {0};
   W[0] = OP_DISPENSE;
   W[1] = 0;              // seq=0
@@ -346,12 +391,108 @@ bool api_dispense(uint16_t motorId, float target_g, float slowOffset_g, float so
 
   logSent_DISPENSE(motorId, target_g, slowOffset_g, softCutOffset_g, timeout_s);
 
-  uint32_t toMs = (uint32_t)timeout_s * 1000UL + 10000UL;
-  if (toMs < 15000UL) toMs = 15000UL;
-  if (toMs > 9UL*60UL*1000UL) toMs = 9UL*60UL*1000UL;
-
+  uint32_t toMs = 2000; // quick acceptance
   return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
                              REG_CMD_BASE, W, 7, outRegs, RES_QTY, toMs);
+}
+
+// ---------------------------------------------
+// Pending operation scheduler (non-blocking)
+// ---------------------------------------------
+enum : uint8_t { PK_NONE=0, PK_RINSE, PK_TRIGGER, PK_DISPENSE };
+
+struct PendingOp {
+  uint8_t kind = PK_NONE;
+  uint32_t deadline = 0;       // absolute ms when we warn timeout (but keep polling)
+  uint32_t nextPollDue = 0;    // cadence
+  bool printedTimeout = false; // print timeout once
+} pending;
+
+bool abortRequested = false;
+
+const char* pendingLabel(uint8_t k) {
+  switch (k) {
+    case PK_RINSE:    return "rinse";
+    case PK_TRIGGER:  return "trigger";
+    case PK_DISPENSE: return "dispense";
+    default:          return "?";
+  }
+}
+
+void armPending(uint8_t k, uint32_t extraMs) {
+  pending.kind = k;
+  pending.printedTimeout = false;
+  pending.nextPollDue = millis() + STATUS_POLL_MS;
+  pending.deadline = millis() + extraMs;
+}
+
+void clearPending() {
+  pending.kind = PK_NONE;
+  pending.deadline = 0;
+  pending.nextPollDue = 0;
+  pending.printedTimeout = false;
+}
+
+// One silent STATUS poll tick; returns true if got response and filled R
+bool pollStatusOnce(uint16_t* R) {
+  uint16_t W[8] = {0};
+  W[0] = OP_STATUS; W[1] = 0;
+  return mbReadWriteMultiple(SLAVE_ID, REG_RES_BASE, RES_QTY,
+                             REG_CMD_BASE, W, 2, R, RES_QTY, 600, /*verboseOnError*/false);
+}
+
+void servicePending() {
+  if (pending.kind == PK_NONE) return;
+
+  uint32_t now = millis();
+
+  // Abort request has priority over polling
+  if (abortRequested) {
+    uint16_t R[RES_QTY] = {0};
+    bool ok = api_abort(R, 800);
+    abortRequested = false;
+    if (ok) {
+      printResultBrief(R); // immediate feedback for the operator
+      // Keep polling to observe transition to ABORTED_FAULT (or other not ACTIVE)
+      pending.nextPollDue = now + 100;
+    } else {
+      Serial.println(F("[abort] NO RESPONSE / CRC/timeout"));
+    }
+    return;
+  }
+
+  // Not time to poll yet
+  if ((long)(now - pending.nextPollDue) < 0) return;
+
+  // Silent STATUS poll
+  uint16_t R[RES_QTY] = {0};
+  bool ok = pollStatusOnce(R);
+  if (!ok) {
+    // Missed poll — just try again next cadence
+    pending.nextPollDue = millis() + STATUS_POLL_MS;
+    return;
+  }
+
+  uint16_t st = R[2];
+
+  if (st != 1) { // not ACTIVE -> finalize
+    if (st == 0) {
+      Serial.print('['); Serial.print(pendingLabel(pending.kind)); Serial.println(F("] done."));
+    } else {
+      Serial.print('['); Serial.print(pendingLabel(pending.kind)); Serial.print(F("] ended: "));
+      Serial.println(statusToStr(st));
+    }
+    clearPending();
+    return;
+  }
+
+  // Still ACTIVE; check deadline (print ONCE)
+  if (!pending.printedTimeout && (long)(now - pending.deadline) > 0) {
+    Serial.print('['); Serial.print(pendingLabel(pending.kind)); Serial.println(F("] wait timeout; still ACTIVE"));
+    pending.printedTimeout = true; // keep polling silently afterward
+  }
+
+  pending.nextPollDue = millis() + STATUS_POLL_MS;
 }
 
 // ---------------------------------------------
@@ -363,8 +504,9 @@ void printHelp() {
   Serial.println(F("Commands:"));
   Serial.println(F("  status"));
   Serial.println(F("  clear"));
+  Serial.println(F("  abort"));
   Serial.println(F("  rinse <seconds>"));
-  Serial.println(F("  trigger <motorId|name> <seconds>   e.g. 'trigger 102 1.0' or 'trigger sauce2 1.0'"));
+  Serial.println(F("  trigger <motorId|name> <seconds>   e.g. 'trigger 102 1.0' or 'trigger Sauce2 1.0'"));
   Serial.println(F("  dispense <motorId|name> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>"));
 }
 
@@ -383,14 +525,17 @@ void setup() {
 
   // Quick probe
   uint16_t R[RES_QTY] = {0};
-  Serial.print(F("\n[boot] Probing STATUS..."));
-  Serial.print(F("\n"));
-  bool ok = api_status(R, 1500);
-  if (ok) { Serial.println(F("Modbus OK")); printResultRegs(R); }
+  Serial.print(F("\n[boot] Probing STATUS...\n"));
+  bool ok = api_status_logged(R, 1500);
+  if (ok) { Serial.println(F("Modbus OK")); printResultBrief(R); }
   else    { Serial.println(F("NO RESPONSE / CRC")); }
 }
 
 void loop() {
+  // Service background pending operation at steady cadence
+  servicePending();
+
+  // Non-blocking CLI
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c=='\r') continue;
@@ -407,66 +552,113 @@ void loop() {
         printHelp();
       }
       else if (low == "status") {
-        ok = api_status(R);
-        Serial.println(ok ? F("[status] response:") : F("[status] NO RESPONSE / CRC/timeout"));
-        if (ok) printResultRegs(R);
+        ok = api_status_logged(R);
+        if (ok) printResultBrief(R);
+        else    Serial.println(F("[status] NO RESPONSE / CRC/timeout"));
       }
       else if (low == "clear") {
         ok = api_clear(R);
-        Serial.println(ok ? F("[clear] response:") : F("[clear] NO RESPONSE / CRC/timeout"));
-        if (ok) printResultRegs(R);
+        if (ok) printResultBrief(R);
+        else    Serial.println(F("[clear] NO RESPONSE / CRC/timeout"));
+      }
+      else if (low == "abort") {
+        if (pending.kind != PK_NONE) abortRequested = true;
+        ok = api_abort(R, 800);
+        if (ok) printResultBrief(R);
+        else    Serial.println(F("[abort] NO RESPONSE / CRC/timeout"));
       }
       else if (low.startsWith("rinse ")) {
-        String s = cmd.substring(6); s.trim();
-        float secs = s.toFloat();
-        ok = api_rinse(secs, R);
-        Serial.println(ok ? F("[rinse] response:") : F("[rinse] NO RESPONSE / CRC/timeout"));
-        if (ok) printResultRegs(R);
+        if (pending.kind != PK_NONE) {
+          Serial.println(F("[busy] operation in progress; type 'abort' or 'status'."));
+        } else {
+          String s = cmd.substring(6); s.trim();
+          float secs = s.toFloat();
+          ok = api_rinse(secs, R);
+          if (!ok) {
+            Serial.println(F("[rinse] NO RESPONSE / CRC/timeout"));
+          } else {
+            printResultBrief(R);
+            if (R[0]==RC_OK && R[2]==1) {
+              uint32_t guard = 5000UL;
+              armPending(PK_RINSE, (uint32_t)(secs*1000.0f) + guard);
+            }
+          }
+        }
       }
       else if (low.startsWith("trigger ")) {
-        String rest = cmd.substring(8); rest.trim();
-        int sp = rest.indexOf(' ');
-        if (sp < 0) {
-          Serial.println(F("Use: trigger <motorId|name> <seconds>"));
+        if (pending.kind != PK_NONE) {
+          Serial.println(F("[busy] operation in progress; type 'abort' or 'status'."));
         } else {
-          String tok  = rest.substring(0, sp); tok.trim();
-          String ssec = rest.substring(sp+1); ssec.trim();
-          uint16_t motorId;
-          if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
-          float secs = ssec.toFloat();
-          ok = api_trigger(motorId, secs, R);
-          Serial.println(ok ? F("[trigger] response:") : F("[trigger] NO RESPONSE / CRC/timeout"));
-          if (ok) printResultRegs(R);
+          String rest = cmd.substring(8); rest.trim();
+          int sp = rest.indexOf(' ');
+          if (sp < 0) {
+            Serial.println(F("Use: trigger <motorId|name> <seconds>"));
+          } else {
+            String tok  = rest.substring(0, sp); tok.trim();
+            String ssec = rest.substring(sp+1); ssec.trim();
+            uint16_t motorId;
+            if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
+            float secs = ssec.toFloat();
+
+            ok = api_trigger(motorId, secs, R);
+            if (!ok) {
+              Serial.println(F("[trigger] NO RESPONSE / CRC/timeout"));
+            } else {
+              printResultBrief(R);
+              if (R[0]==RC_OK && R[2]==1) {
+                uint32_t guard = 5000UL;
+                armPending(PK_TRIGGER, (uint32_t)(secs*1000.0f) + guard);
+              }
+            }
+          }
         }
       }
       else if (low.startsWith("dispense ")) {
-        String rest = cmd.substring(9); rest.trim();
-        int sp1 = rest.indexOf(' ');
-        int sp2 = rest.indexOf(' ', sp1+1);
-        int sp3 = rest.indexOf(' ', sp2+1);
-        int sp4 = rest.indexOf(' ', sp3+1);
-        if (sp1<0 || sp2<0 || sp3<0 || sp4<0) {
-          Serial.println(F("Use: dispense <motorId|name> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>"));
+        if (pending.kind != PK_NONE) {
+          Serial.println(F("[busy] operation in progress; type 'abort' or 'status'."));
         } else {
-          String tok       = rest.substring(0, sp1); tok.trim();
-          float target_g   = rest.substring(sp1+1, sp2).toFloat();
-          float slow_g     = rest.substring(sp2+1, sp3).toFloat();
-          float soft_g     = rest.substring(sp3+1, sp4).toFloat();
-          uint16_t tout_s  = (uint16_t)rest.substring(sp4+1).toInt();
+          String rest = cmd.substring(9); rest.trim();
+          int sp1 = rest.indexOf(' ');
+          int sp2 = rest.indexOf(' ', sp1+1);
+          int sp3 = rest.indexOf(' ', sp2+1);
+          int sp4 = rest.indexOf(' ', sp3+1);
+          if (sp1<0 || sp2<0 || sp3<0 || sp4<0) {
+            Serial.println(F("Use: dispense <motorId|name> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>"));
+          } else {
+            String tok       = rest.substring(0, sp1); tok.trim();
+            float target_g   = rest.substring(sp1+1, sp2).toFloat();
+            float slow_g     = rest.substring(sp2+1, sp3).toFloat();
+            float soft_g     = rest.substring(sp3+1, sp4).toFloat();
+            uint16_t tout_s  = (uint16_t)rest.substring(sp4+1).toInt();
 
-          uint16_t motorId;
-          if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
+            uint16_t motorId;
+            if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); continue; }
 
-          ok = api_dispense(motorId, target_g, slow_g, soft_g, tout_s, R);
-          Serial.println(ok ? F("[dispense] response:") : F("[dispense] NO RESPONSE / CRC/timeout"));
-          if (ok) printResultRegs(R);
+            ok = api_dispense(motorId, target_g, slow_g, soft_g, tout_s, R);
+            if (!ok) {
+              Serial.println(F("[dispense] NO RESPONSE / CRC/timeout"));
+            } else {
+              printResultBrief(R);
+              if (R[0]==RC_OK && R[2]==1) {
+                uint32_t guard = 10000UL; // extra for settle/coast/comm
+                armPending(PK_DISPENSE, (uint32_t)tout_s*1000UL + guard);
+              }
+            }
+          }
         }
       }
       else {
         Serial.println(F("Unknown command. Type 'help'."));
       }
+
+      // After each command line, immediately service pending once to keep it snappy
+      servicePending();
+
     } else {
       if (inLine.length() < 120) inLine += c;
     }
   }
+
+  // Idle tick: service pending again if due
+  servicePending();
 }
