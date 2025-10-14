@@ -30,7 +30,6 @@ Authors: **Erdie Gange · ChatGPT 5** · Region: **Asia/Riyadh**
 - [Reference Master CLI](#reference-master-cli)
 - [Troubleshooting](#troubleshooting)
 - [Version history](#version-history)
-- [License](#license)
 
 ---
 
@@ -232,9 +231,4 @@ result=FAIL  error=LEAK_FAULT
 ## Version history
 - **Controller v1.1** — All faults **latched**; new **ABORT** command (`ABORTED` state); clarified synchronous 0x17 execution.  
 - **Scale v1.0** — I²C `'R'+target_x10` with auto‑tare; `HI` overflow; auto‑idle; EEPROM‑persisted scale.
-
----
-
-## License
-Specify your license here (e.g., MIT). If this is internal, keep the repo private or add a restrictive license notice.
 
