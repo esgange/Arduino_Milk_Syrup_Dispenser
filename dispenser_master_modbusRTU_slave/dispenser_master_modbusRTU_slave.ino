@@ -62,6 +62,11 @@ static uint16_t faultToApiError(uint8_t systemStatus);
 const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD; // ~573 us @19200
 const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0 ms
 
+// ---------- FIX: Static Modbus TX buffer (eliminate malloc) ----------
+#define MB_MAX_READ_QTY 64  // max 16-bit registers returned in one read (master uses 11)
+static uint8_t mb_resp_buf[3 + 2*MB_MAX_READ_QTY + 2];
+// --------------------------------------------------------------------
+
 // ===================== Scale config (variables only) =====================
 const uint8_t MILK_SCALE_ADDR  = 0x2A; // Milk scale address
 const uint8_t SAUCE_SCALE_ADDR = 0x2B; // Sauce scale address
@@ -1089,17 +1094,28 @@ static void handleModbus() {
     apiBusy = false;
   }
 
+  // ---------- FIX: Use static TX buffer; guard max read qty ----------
+  if (readQty > MB_MAX_READ_QTY) {
+    // Illegal data value
+    uint8_t ex[5];
+    ex[0] = addr; ex[1] = func | 0x80; ex[2] = 0x03;
+    uint16_t ecrc = mb_crc16(ex, 3);
+    ex[3] = (uint8_t)(ecrc & 0xFF); ex[4] = (uint8_t)(ecrc >> 8);
+    delayMicroseconds(MB_T3P5_US);
+    rs485TxMode(); MODBUS_SERIAL.write(ex, 5); MODBUS_SERIAL.flush(); rs485RxMode();
+    return;
+  }
+
   const uint16_t respBytes = (uint16_t)(readQty * 2);
-  uint16_t outLen = 3 + respBytes + 2;
-  uint8_t* resp = (uint8_t*)malloc(outLen);
-  if (!resp) return;
+  uint16_t outLen = (uint16_t)(3 + respBytes + 2);
+  uint8_t* resp = mb_resp_buf;
 
   resp[0] = addr;
   resp[1] = func;
   resp[2] = (uint8_t)respBytes;
 
   for (uint16_t i=0;i<readQty;i++) {
-    uint16_t v = regRead(readStart + i);
+    uint16_t v = regRead((uint16_t)(readStart + i));
     resp[3 + 2*i]     = (uint8_t)(v >> 8);
     resp[3 + 2*i + 1] = (uint8_t)(v & 0xFF);
   }
@@ -1111,7 +1127,7 @@ static void handleModbus() {
   rs485TxMode();
   MODBUS_SERIAL.write(resp, outLen);
   MODBUS_SERIAL.flush();
+  delayMicroseconds(MB_CHAR_US);     // ~573 µs @19200 — give master time to drop DE
   rs485RxMode();
-
-  free(resp);
+  // ------------------------------------------------------
 }

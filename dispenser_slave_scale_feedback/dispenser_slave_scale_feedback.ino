@@ -79,13 +79,13 @@ const byte PIN_LED_GREEN = 0; // RX pin -> Green LED
 const byte PIN_LED_RED   = 1; // TX pin -> Red LED
 
 /* ─────────────────────────────────── I2C ─────────────────────────────────── */
-const uint8_t I2C_ADDR = 0x2B;  // Slave address //////////////////////////////// *We use 0x2B for Sauces, 0x2A for Milks. <----------
+const uint8_t I2C_ADDR = 0x2A;  // Slave address //////////////////////////////// *We use 0x2B for Sauces, 0x2A for Milks. <----------
 
 /* ───────────────────────────────── TIMING ────────────────────────────────── */
 const uint16_t SCAN_INTERVAL_US = 2000;   // Per-digit scan; smaller = brighter
 const uint32_t BTN_DEBOUNCE_MS  = 50;
 const uint32_t BTN_LONG_MS      = 3000;
-const uint32_t INACTIVITY_MS    = 60000;  // 60 s to drop to IDLE
+const uint32_t INACTIVITY_MS    = 60000;  // 60 s to drop to IDLEdasd
 const float    MAJOR_CHANGE_G   = 1.0f;   // Significant movement threshold
 
 /* ────────────────────────────── SCALE / FILTER ───────────────────────────── */

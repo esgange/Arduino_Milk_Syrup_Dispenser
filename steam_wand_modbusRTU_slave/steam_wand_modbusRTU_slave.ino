@@ -1,51 +1,46 @@
 /*
   ┌───────────────────────────────────────────────────────────────────────────┐
-  │ Steam Wand Module — Modbus RTU Slave                                     │
+  │ Steam Wand Module — Modbus RTU Slave (aligned to Motor Controller style) │
   │ Target MCU: Arduino Nano Every (megaAVR 4809)                            │
   └───────────────────────────────────────────────────────────────────────────┘
 
-  Version : 1.6  (ABORT-only manual control + CLI help + structured datalogs)
-  Date    : 2025-10-14  (Asia/Riyadh)
+  Version : 2.3+
+  Date    : 2025-10-20  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
   What this firmware does
   ───────────────────────
   • Steam-wand controller with a single-shot Modbus RTU slave API (Function 0x17).
-  • Exposes: STATUS(1), ABORT(2), INIT(10), FROTH(11), CLEAN(12).
-  • **ABORT** is the sole way to enter manual control (L298 inputs Hi‑Z).
-  • Boots in manual control (Hi‑Z) and **auto-enables** drivers on first use.
-  • Adds **CLI help** and **structured datalogs** (see tags: [api], [run], [cfg], [event], [warn]).
+  • API: STATUS(1), CLEAR(2), ABORT(3), OFF(4), INIT(10), FROTH(11), CLEAN(12).
+  • Non-blocking INIT/FROTH/CLEAN so ABORT can preempt at any time (latched ABORT).
+  • Boots in manual control (L298 inputs Hi-Z); auto-enables drivers on first use.
+  • STANDBY/IDLE posture actively drives M1 forward + M2 reverse.
+  • Faults produced: TIMEOUT and ABORTED.
+  • NEW: OFF is a distinct SystemStatus (7). ABORT keeps ABORTED_FAULT status but
+    sets motors to IDLE (STANDBY) posture, not OFF/Hi-Z.
 
-  Register map (Holding, 16‑bit big‑endian)
-  ──────────────────────────────────────────
-    Command Block @ 0x0000
-      0x0000  opcode: 1=STATUS, 2=ABORT, 10=INIT, 11=FROTH, 12=CLEAN
-      0x0001  seq (echo)
-      0x0002..0x0007  args (x100 scaling for seconds/°C)
+  Bus coexistence
+  ───────────────
+  • RS-485 half-duplex; this node uses Slave ID=2, only drives TX when addressed.
+  • DE/RE turnaround guard on TX is generous for MAX485-style transceivers.
 
-    Result Block @ 0x0100
-      0x0100  resultCode: 0=OK, 1=FAIL
-      0x0101  errorCode : 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD
-      0x0102  systemStatus: 0=IDLE,1=ACTIVE,4=SCALE_FAULT,5=TIMEOUT_FAULT
-      0x0103  seq (echo)
-      0x0104  aux0 = TEMP_Cx100          (signed; -32768 if invalid)
-      0x0105  aux1 = elapsed_s_x10       (if applicable)
-      0x0106..0x010A  reserved/0
+  Register map (Holding)
+  ──────────────────────
+    Command Block @ 0x0000 (write before/with 0x17)
+      0x0000  OPCODE: 1=STATUS, 2=CLEAR, 3=ABORT, 4=OFF, 10=INIT, 11=FROTH, 12=CLEAN
+      0x0001  SEQ (echo)
+      0x0002..0x0006  args (×10 scaling for seconds / °C)
 
-  CLI (USB) commands (type 'help')
-  ────────────────────────────────
-    help
-    status
-    abort
-    init  <seconds>
-    froth <targetC> <timeout_s>
-    clean <tValve_s> <tSteam_s> <tStandby_s>
-
-  Notes
-  ─────
-  • External pull‑downs must be present on ENA/ENB and IN1..IN4.
-  • L298 inputs are set to INPUT (Hi‑Z) in manual-control.
-  • Any motor action auto‑enables ENA/ENB and sets INx as OUTPUT before driving.
+    Result Block @ 0x0100 (read in same 0x17)
+      0x0100  RC: 0=OK, 1=FAIL
+      0x0101  ERR: 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD,8=ABORTED
+               (Only TIMEOUT and ABORTED are produced by this firmware.)
+      0x0102  SYSTEM_STATUS:
+               0=IDLE,1=ACTIVE,5=TIMEOUT_FAULT,6=ABORTED_FAULT,7=OFF   ← NEW OFF
+      0x0103  SEQ echo
+      0x0104  AUX0 = TEMP_C×10  (uint16; 0 if invalid)
+      0x0105  ELAPSED_S×10      (set by ops; ABORT sets immediately)
+      0x0106..0x010A  reserved=0
 */
 
 #include <Arduino.h>
@@ -56,16 +51,17 @@
 #define HAVE_L298_PULLDOWNS  1   // external pulldowns present on EN/IN lines
 
 /* ========================= Modbus / RS-485 =========================== */
-#define SLAVE_ID        2
-#define MODBUS_BAUD     19200
-#define MODBUS_CONFIG   SERIAL_8N1
+#define MODBUS_SLAVE_ID  2
+#define MODBUS_BAUD      19200
+#define MODBUS_CONFIG    SERIAL_8N1
 
-const uint8_t RS485_RE_PIN = A1;  // RE: LOW = RX enable
+const uint8_t RS485_RE_PIN = A1;  // RE: LOW = RX enable (active-low receiver enable)
 const uint8_t RS485_DE_PIN = A2;  // DE: HIGH = TX enable
 #define MODBUS_PORT Serial1
 
-const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD; // ~573us @19200
-const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0ms
+// Conservative 11-bit char timing (ok for MAX485), T3.5 ≈ 2.0 ms @ 19,200
+const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD;
+const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);
 
 /* ========================= Hardware map ============================== */
 const uint8_t SOLENOID_PIN = 2;
@@ -81,18 +77,37 @@ const uint8_t TC_SO  = 12;
 const uint8_t TC_CS  = 10;
 const uint8_t TC_SCK = 13;
 
+/* ========================= Timings & limits ========================== */
+const unsigned long MAX_TIMEOUT_MS   = 10UL * 60UL * 1000UL;
+
 /* ========================= App state ================================= */
 enum Mode : uint8_t { MODE_OFF, MODE_STANDBY, MODE_INIT, MODE_FROTH, MODE_CLEAN };
-volatile bool g_isBusy = false;
-volatile bool g_abort  = false;
-Mode g_currentMode     = MODE_OFF;
+Mode currentMode = MODE_OFF;
 
-static unsigned long g_lastTcReadMs = 0;
-static float  g_tempC   = NAN;
-static bool   g_tempOk  = false;
-static uint16_t g_errorMask = 0;   // bit0=TCfault, bit1=aborted, bit2=timeout
-static uint32_t g_lastElapsedMs = 0;
-static bool g_motorsEnabled = false;  // for auto re-enable
+volatile bool apiBusy      = false;   // transaction guard
+volatile bool opBusy       = false;   // true while an operation is active
+volatile bool abortRequested = false; // set by ABORT opcode
+
+/* Non-blocking operation engine */
+enum ActiveOp : uint8_t { OP_NONE, OP_INIT_NB, OP_FROTH_NB, OP_CLEAN_NB };
+volatile ActiveOp activeOp = OP_NONE;
+
+static unsigned long opStartMs = 0;
+static unsigned long opPhaseEndMs = 0; // per-phase for CLEAN
+static uint8_t cleanPhase = 0;         // 0=valve,1=steam,2=standby
+
+/* FROTH params */
+static uint16_t targetC_x10 = 0;
+static uint16_t timeout_s_x10 = 0;
+
+/* INIT/CLEAN params */
+static uint16_t initSeconds_x10 = 0;
+static uint16_t clean_tValve_x10 = 0, clean_tSteam_x10 = 0, clean_tStandby_x10 = 0;
+
+/* Temperature cache */
+static unsigned long lastTcReadMs = 0;
+static float  tempC   = NAN;
+static bool   tempOk  = false;
 
 /* ========================= Result / API =============================== */
 #define REG_SPACE_SIZE   0x0120
@@ -101,95 +116,106 @@ static uint16_t regSpace[REG_SPACE_SIZE]; // holding register image
 enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 
 enum ApiError : uint16_t {
-  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7
+  AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7, AE_ABORTED=8
+  // NOTE: Only AE_TIMEOUT and AE_ABORTED are emitted by this firmware.
 };
 
-enum Opcode : uint16_t { OP_STATUS=1, OP_ABORT=2, OP_INIT=10, OP_FROTH=11, OP_CLEAN=12 };
+enum Opcode : uint16_t {
+  OP_STATUS=1, OP_CLEAR=2, OP_ABORT=3, OP_OFF=4, OP_INIT=10, OP_FROTH=11, OP_CLEAN=12
+};
 
 enum SystemStatus : uint16_t {
   SYS_IDLE=0,
   SYS_ACTIVE=1,
-  /*2=MOTOR_FAULT (unused)*/
-  /*3=LEAK_FAULT  (unused)*/
-  SYS_SCALE_FAULT=4,
-  SYS_TIMEOUT_FAULT=5
+  SYS_MOTOR_FAULT=2,   // never used here
+  SYS_LEAK_FAULT=3,    // never used here
+  SYS_SCALE_FAULT=4,   // never used here
+  SYS_TIMEOUT_FAULT=5,
+  SYS_ABORTED_FAULT=6,
+  SYS_OFF=7            // NEW: OFF distinct from IDLE
 };
 volatile SystemStatus systemStatus = SYS_IDLE;
 
-volatile bool apiBusy = false;
-
-/* ========================= Helpers: names & logging =================== */
-static const __FlashStringHelper* modeName(Mode m){
-  switch(m){
-    case MODE_OFF: return F("OFF");
-    case MODE_STANDBY: return F("STANDBY");
-    case MODE_INIT: return F("INIT");
-    case MODE_FROTH: return F("FROTH");
-    case MODE_CLEAN: return F("CLEAN");
-    default: return F("?");
-  }
-}
-static const __FlashStringHelper* sysName(SystemStatus s){
-  switch(s){
-    case SYS_IDLE: return F("IDLE");
-    case SYS_ACTIVE: return F("ACTIVE");
-    case SYS_SCALE_FAULT: return F("SCALE_FAULT");
-    case SYS_TIMEOUT_FAULT: return F("TIMEOUT_FAULT");
-    default: return F("?");
-  }
-}
-static const __FlashStringHelper* opName(uint16_t op){
-  switch(op){
-    case OP_STATUS: return F("STATUS");
-    case OP_ABORT:  return F("ABORT");
-    case OP_INIT:   return F("INIT");
-    case OP_FROTH:  return F("FROTH");
-    case OP_CLEAN:  return F("CLEAN");
-    default:        return F("UNKNOWN");
+/* ========================= Logging helpers =========================== */
+static const __FlashStringHelper* systemStatusStr(){
+  switch (systemStatus){
+    case SYS_IDLE:           return F("IDLE");
+    case SYS_ACTIVE:         return F("ACTIVE");
+    case SYS_MOTOR_FAULT:    return F("MOTOR_FAULT");
+    case SYS_LEAK_FAULT:     return F("LEAK_FAULT");
+    case SYS_SCALE_FAULT:    return F("SCALE_FAULT");
+    case SYS_TIMEOUT_FAULT:  return F("TIMEOUT_FAULT");
+    case SYS_ABORTED_FAULT:  return F("ABORTED_FAULT");
+    case SYS_OFF:            return F("OFF");
+    default:                 return F("UNKNOWN");
   }
 }
 
-static void logSnapshot(const __FlashStringHelper* tag){
-  Serial.print(F("[event] ")); Serial.print(tag);
-  Serial.print(F(" mode=")); Serial.print(modeName(g_currentMode));
-  Serial.print(F(" sys=")); Serial.print(sysName(systemStatus));
-  Serial.print(F(" busy=")); Serial.print(g_isBusy?F("YES"):F("NO"));
-  Serial.print(F(" motors=")); Serial.print(g_motorsEnabled?F("EN"):F("HZ"));
-  Serial.print(F(" t=")); Serial.print(millis()/1000.0f,3); Serial.print(F(" s"));
-  if (g_tempOk){ Serial.print(F(" temp=")); Serial.print(g_tempC,2); Serial.print(F(" C")); }
-  else          { Serial.print(F(" temp=fault/open")); }
+static inline void printCommonNoTime(){
+  Serial.print(F(" mode="));
+  switch (currentMode){
+    case MODE_OFF:     Serial.print(F("OFF")); break;
+    case MODE_STANDBY: Serial.print(F("STANDBY")); break;
+    case MODE_INIT:    Serial.print(F("INIT")); break;
+    case MODE_FROTH:   Serial.print(F("FROTH")); break;
+    case MODE_CLEAN:   Serial.print(F("CLEAN")); break;
+  }
+  Serial.print(F(" sys=")); Serial.print(systemStatusStr());
+  Serial.print(F(" busy=")); Serial.print(opBusy ? F("YES") : F("NO"));
   Serial.println();
 }
+static inline void printCommonEndWithTime(){
+  Serial.print(F(" t="));
+  float t = (opStartMs ? (millis() - opStartMs) / 1000.0f : 0.0f);
+  Serial.print(t, 3);
+  Serial.println(F(" s"));
+}
 
-static void logApiStart(uint16_t opcode){
-  Serial.print(F("[api] START ")); Serial.print(opName(opcode));
-  Serial.print(F(" t=")); Serial.print(millis()/1000.0f,3); Serial.println(F(" s"));
+/* Begin-event logs */
+void logBegin_INIT(uint16_t secs_x10){
+  Serial.print(F("[event] INIT_BEGIN"));
+  Serial.print(F(" secs=")); Serial.print(secs_x10/10.0f, 1);
+  printCommonNoTime();
 }
-static void logApiArgs_INIT(float secs){
-  Serial.print(F("[cfg] INIT secs=")); Serial.println(secs,2);
+void logBegin_FROTH(uint16_t targetCx10, uint16_t timeoutSx10){
+  Serial.print(F("[event] FROTH_BEGIN"));
+  Serial.print(F(" targetC=")); Serial.print(targetCx10/10.0f, 1);
+  Serial.print(F("C"));
+  Serial.print(F(" timeout_s=")); Serial.print(timeoutSx10/10.0f, 1);
+  printCommonNoTime();
 }
-static void logApiArgs_FROTH(float targetC, float timeout_s){
-  Serial.print(F("[cfg] FROTH targetC=")); Serial.print(targetC,2);
-  Serial.print(F(" C timeout=")); Serial.print(timeout_s,2); Serial.println(F(" s"));
+void logBegin_CLEAN(uint16_t tValve_x10, uint16_t tSteam_x10, uint16_t tStandby_x10){
+  Serial.print(F("[event] CLEAN_P0_BEGIN"));
+  Serial.print(F(" tValve_s="));   Serial.print(tValve_x10/10.0f, 1);
+  Serial.print(F(" tSteam_s="));   Serial.print(tSteam_x10/10.0f, 1);
+  Serial.print(F(" tStandby_s=")); Serial.print(tStandby_x10/10.0f, 1);
+  printCommonNoTime();
 }
-static void logApiArgs_CLEAN(float tValve, float tSteam, float tStandby){
-  Serial.print(F("[cfg] CLEAN tValve=")); Serial.print(tValve,2);
-  Serial.print(F(" s tSteam=")); Serial.print(tSteam,2);
-  Serial.print(F(" s tStandby=")); Serial.print(tStandby,2); Serial.println(F(" s"));
+void logBegin_CLEAN_P1(uint16_t tSteam_x10){
+  Serial.print(F("[event] CLEAN_P1_STEAM"));
+  Serial.print(F(" tSteam_s=")); Serial.print(tSteam_x10/10.0f, 1);
+  printCommonNoTime();
 }
-static void logApiBusyReject(uint16_t opcode){
-  Serial.print(F("[api] REJECT BUSY for ")); Serial.println(opName(opcode));
+void logBegin_CLEAN_P2(uint16_t tStandby_x10){
+  Serial.print(F("[event] CLEAN_P2_STANDBY"));
+  Serial.print(F(" tStandby_s=")); Serial.print(tStandby_x10/10.0f, 1);
+  printCommonNoTime();
 }
-static void logApiDone(uint16_t opcode, uint16_t rc, uint16_t err, unsigned long elapsedMs){
-  Serial.print(F("[api] DONE  ")); Serial.print(opName(opcode));
-  Serial.print(F(" rc=")); Serial.print(rc==RC_OK?F("OK"):F("FAIL"));
-  Serial.print(F(" err=")); Serial.print(err);
-  Serial.print(F(" elap=")); Serial.print(elapsedMs/1000.0f,3); Serial.println(F(" s"));
+
+/* End-event logs */
+void logEnd(const __FlashStringHelper* label){
+  Serial.print(F("[event] ")); Serial.print(label);
+  printCommonEndWithTime();
+}
+void logEnd_FrothTargetReached(float tempC_now){
+  Serial.print(F("[event] FROTH_TARGET_REACHED"));
+  Serial.print(F(" tempC=")); Serial.print(tempC_now, 1);
+  printCommonEndWithTime();
 }
 
 /* ========================= RS-485 / CRC =============================== */
 inline void rs485RxMode(){ digitalWrite(RS485_DE_PIN, LOW); digitalWrite(RS485_RE_PIN, LOW); }
-inline void rs485TxMode(){ digitalWrite(RS485_RE_PIN, HIGH); digitalWrite(RS485_DE_PIN, HIGH); }
+inline void rs485TxMode(){ digitalWrite(RS485_RE_PIN, HIGH); digitalWrite(RS485_DE_PIN, HIGH); delayMicroseconds(150); } // generous turnaround guard
 
 uint16_t mb_crc16(const uint8_t* buf, uint16_t len){
   uint16_t crc=0xFFFF;
@@ -202,25 +228,22 @@ uint16_t mb_crc16(const uint8_t* buf, uint16_t len){
   }
   return crc;
 }
-void mb_send(const uint8_t* data, uint16_t len){
-  rs485TxMode();
-  MODBUS_PORT.write(data, len);
-  MODBUS_PORT.flush();
-  rs485RxMode();
-}
+
 void mb_send_ok(const uint8_t addr, const uint8_t* pdu, uint16_t pdulen){
   uint8_t frame[260];
   frame[0]=addr;
   memcpy(frame+1, pdu, pdulen);
   uint16_t crc = mb_crc16(frame, pdulen+1);
-  frame[pdulen+1] = crc & 0xFF;
-  frame[pdulen+2] = (crc>>8) & 0xFF;
-  mb_send(frame, pdulen+3);
+  frame[pdulen+1] = crc & 0xFF;           // CRC lo
+  frame[pdulen+2] = (crc>>8) & 0xFF;      // CRC hi
+  rs485TxMode();
+  MODBUS_PORT.write(frame, pdulen+3);
+  MODBUS_PORT.flush();
+  rs485RxMode();
+  delayMicroseconds(MB_CHAR_US);          // let line settle
 }
 void mb_send_exc(const uint8_t addr, uint8_t func, uint8_t code){
-  uint8_t resp[3];
-  resp[0] = func | 0x80;
-  resp[1] = code;
+  uint8_t resp[3]; resp[0] = (uint8_t)(func | 0x80); resp[1] = code;
   mb_send_ok(addr, resp, 2);
 }
 
@@ -229,12 +252,14 @@ static inline uint16_t regRead(uint16_t addr){ return (addr<REG_SPACE_SIZE)? reg
 static inline void     regWrite(uint16_t addr, uint16_t val){ if(addr<REG_SPACE_SIZE) regSpace[addr]=val; }
 
 /* ========================= L298 controls ============================== */
+static bool motorsEnabled = false;
+
 static inline void enableMotors(){
   pinMode(ENA_PIN, OUTPUT); pinMode(ENB_PIN, OUTPUT);
   digitalWrite(ENA_PIN, HIGH); digitalWrite(ENB_PIN, HIGH);
   pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
   pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
-  g_motorsEnabled = true;
+  motorsEnabled = true;
 }
 static inline void disableMotors(){
 #if HAVE_L298_PULLDOWNS
@@ -249,9 +274,9 @@ static inline void disableMotors(){
   pinMode(M2_IN1, OUTPUT);  digitalWrite(M2_IN1, LOW);
   pinMode(M2_IN2, OUTPUT);  digitalWrite(M2_IN2, LOW);
 #endif
-  g_motorsEnabled = false;
+  motorsEnabled = false;
 }
-static inline void ensureMotorsEnabled(){ if (!g_motorsEnabled) enableMotors(); }
+static inline void ensureMotorsEnabled(){ if (!motorsEnabled) enableMotors(); }
 
 inline void mStop(uint8_t in1, uint8_t in2){ digitalWrite(in1, LOW);  digitalWrite(in2, LOW); }
 inline void mFwd (uint8_t in1, uint8_t in2){ digitalWrite(in1, HIGH); digitalWrite(in2, LOW); }
@@ -267,9 +292,20 @@ inline void M2_Rev (){ ensureMotorsEnabled(); mRev (M2_IN1, M2_IN2); }
 inline void solenoidOn()  { digitalWrite(SOLENOID_PIN, HIGH); }
 inline void solenoidOff() { digitalWrite(SOLENOID_PIN, LOW);  }
 
-unsigned long secToMs(float s){ if (s < 0) s = 0; return (unsigned long)(s*1000.0f + 0.5f); }
+static inline void standbyDrive(){
+  ensureMotorsEnabled();
+  M2_Fwd();
+  M1_Rev();
+}
 
-/* ========================= MAX6675 (bit-banged) ======================= */
+static inline unsigned long sec10_to_ms(uint16_t s_x10){
+  // cap to MAX_TIMEOUT_MS
+  unsigned long ms = (unsigned long)((s_x10 * 100UL)); // 0.1 s units → ms
+  if (ms > MAX_TIMEOUT_MS) ms = MAX_TIMEOUT_MS;
+  return ms;
+}
+
+/* ========================= Thermocouple (MAX6675) ===================== */
 uint16_t tc_readRaw(){
   uint16_t v=0;
   digitalWrite(TC_CS, LOW); delayMicroseconds(2);
@@ -283,198 +319,378 @@ uint16_t tc_readRaw(){
   return v;
 }
 bool tc_openFault(uint16_t raw){ return (raw & 0x0004); }
-bool tc_readC_blocking(float &c){
-  unsigned long now = millis();
-  if (now - g_lastTcReadMs < 220UL) delay(220UL - (now - g_lastTcReadMs));
-  g_lastTcReadMs = millis();
-  uint16_t raw = tc_readRaw();
-  if (tc_openFault(raw)){ g_tempOk=false; g_tempC=NAN; return false; }
-  uint16_t data = (raw>>3)&0x0FFF; c = data * 0.25f;
-  g_tempOk=true; g_tempC=c; return true;
-}
+
 bool tc_tryReadC_nonblocking(float &c){
   unsigned long now = millis();
-  if (now - g_lastTcReadMs >= 220UL){
-    g_lastTcReadMs = now; uint16_t raw = tc_readRaw();
-    if (!tc_openFault(raw)){ g_tempC = ((raw>>3)&0x0FFF) * 0.25f; g_tempOk = true; }
-    else { g_tempOk=false; g_tempC=NAN; }
+  if (now - lastTcReadMs >= 220UL){
+    lastTcReadMs = now; uint16_t raw = tc_readRaw();
+    if (!tc_openFault(raw)){ tempC = ((raw>>3)&0x0FFF) * 0.25f; tempOk = true; }
+    else { tempOk=false; tempC=NAN; }
   }
-  c = g_tempC; return g_tempOk;
+  c = tempC; return tempOk;
 }
 
-/* ========================= State helpers ============================== */
-void toOff(){
-  M1_Stop(); M2_Stop(); solenoidOff();
-  disableMotors();
-  g_currentMode=MODE_OFF;
+/* ========================= Output safety ============================== */
+void allOutputsSafe(){
+  solenoidOff();
+  if (motorsEnabled){ M1_Stop(); M2_Stop(); }
+  disableMotors(); // boot/manual-control (Hi-Z)
+  currentMode = MODE_OFF;
 }
-void toStandby(){
-  M1_Rev(); M2_Fwd(); solenoidOff();
-  g_currentMode=MODE_STANDBY;
+
+/* ========================= Clear, Abort & Off ========================= */
+void clearSystem(){
+  allOutputsSafe();
+
+  // Reset op engine
+  opBusy = false; abortRequested = false;
+  activeOp = OP_NONE; cleanPhase = 0;
+  opStartMs = 0; opPhaseEndMs = 0;
+
+  // Reset params
+  targetC_x10 = timeout_s_x10 = 0;
+  initSeconds_x10 = 0;
+  clean_tValve_x10 = 0; clean_tSteam_x10 = 0; clean_tStandby_x10 = 0;
+
+  // Status
+  systemStatus = SYS_IDLE;
+
+  // Result extras
+  regWrite(0x0105, 0); // elapsed
+
+  // Log
+  Serial.print(F("[event] CLEAR"));
+  printCommonNoTime();
+}
+
+// ABORT: keep ABORTED_FAULT status, move to IDLE posture (STANDBY drive)
+void abortNow(){
+  unsigned long t0 = millis();
+
+  // Signal op engine to stop immediately
+  abortRequested = true;
+
+  // Cancel any operation synchronously
+  opBusy = false;
+  activeOp = OP_NONE;
+  cleanPhase = 0;
+
+  // IDLE posture: solenoid off, STANDBY drive (M1_FWD + M2_REV)
+  solenoidOff();
+  standbyDrive();
+  currentMode = MODE_STANDBY;
+
+  // Latch ABORTED fault
+  systemStatus = SYS_ABORTED_FAULT;
+
+  // Build timing metric in ELAPSED_S×10
+  uint16_t elap_x10 = (uint16_t)(((millis()-t0) + 50) / 100);
+  regWrite(0x0105, elap_x10);
+
+  // Log
+  Serial.print(F("[event] ABORTED→IDLE_POSTURE"));
+  printCommonNoTime();
+}
+
+// OFF: go to true OFF/Hi-Z posture and set SYS_OFF (distinct from IDLE)
+void offNow(){
+  // Stop any running op
+  opBusy = false;
+  activeOp = OP_NONE;
+  cleanPhase = 0;
+  abortRequested = false;
+
+  // Drive outputs safe (Hi-Z) and set MODE_OFF
+  allOutputsSafe();
+
+  // NEW: set OFF as a distinct status always
+  systemStatus = SYS_OFF;
+
+  // Log
+  Serial.print(F("[event] OFF"));
+  printCommonNoTime();
 }
 
 /* ========================= Result builder ============================= */
-static uint16_t currentApiError(){
-  if (systemStatus == SYS_TIMEOUT_FAULT) return AE_TIMEOUT;
-  if (systemStatus == SYS_SCALE_FAULT)   return AE_SCALE;
-  return AE_NONE;
+static uint16_t faultToApiError(uint16_t st){
+  switch (st){
+    case SYS_TIMEOUT_FAULT: return AE_TIMEOUT;
+    case SYS_ABORTED_FAULT: return AE_ABORTED;
+    case SYS_MOTOR_FAULT:   return AE_MOTOR;   // legacy/unused
+    case SYS_LEAK_FAULT:    return AE_LEAK;    // legacy/unused
+    case SYS_SCALE_FAULT:   return AE_SCALE;   // legacy/unused
+    default: return AE_NONE;
+  }
 }
+
 static void buildResult(uint16_t rc, uint16_t seq, uint16_t err){
-  int16_t tempx100 = g_tempOk ? (int16_t)lroundf(g_tempC*100.0f) : (int16_t)-32768;
-  uint16_t elap_x10 = (uint16_t)(((g_lastElapsedMs)+50)/100); // 0.1 s units
+  // AUX0: temperature C×10 (0 if invalid)
+  uint16_t tempx10 = 0;
+  if (tempOk && isfinite(tempC)){
+    long v = lroundf(tempC * 10.0f);
+    if (v < 0) v = 0; if (v > 65535) v = 65535;
+    tempx10 = (uint16_t)v;
+  }
+
   regWrite(0x0100, rc);
   regWrite(0x0101, err);
   regWrite(0x0102, (uint16_t)systemStatus);
   regWrite(0x0103, seq);
-  regWrite(0x0104, (uint16_t)tempx100);
+  regWrite(0x0104, tempx10);
+  // 0x0105 (elapsed) is updated by ops/abort; leave as-is unless set by caller
+  regWrite(0x0106, 0); regWrite(0x0107, 0); regWrite(0x0108, 0); regWrite(0x0109, 0); regWrite(0x010A, 0);
+}
+
+/* ========================= Non-blocking operation engine ============= */
+static void startInitSeconds(uint16_t seconds_x10){
+  if (seconds_x10 == 0){ return; }
+  initSeconds_x10 = seconds_x10;
+
+  solenoidOff(); M2_Rev();
+
+  currentMode = MODE_INIT;
+  systemStatus = SYS_ACTIVE;
+  activeOp = OP_INIT_NB;
+  opBusy = true; abortRequested = false;
+  opStartMs = millis();
+  opPhaseEndMs = opStartMs + sec10_to_ms(initSeconds_x10);
+
+  logBegin_INIT(initSeconds_x10);
+}
+
+static void startFroth(uint16_t targetCx10, uint16_t timeoutSx10){
+  targetC_x10 = targetCx10;
+  timeout_s_x10 = timeoutSx10;
+
+  solenoidOff(); M2_Rev();
+
+  currentMode = MODE_FROTH;
+  systemStatus = SYS_ACTIVE;
+  activeOp = OP_FROTH_NB;
+  opBusy = true; abortRequested = false;
+  opStartMs = millis();
+  opPhaseEndMs = opStartMs + sec10_to_ms(timeout_s_x10);
+
+  logBegin_FROTH(targetC_x10, timeout_s_x10);
+}
+
+static void startClean(uint16_t tValve_x10, uint16_t tSteam_x10, uint16_t tStandby_x10){
+  clean_tValve_x10 = tValve_x10;
+  clean_tSteam_x10 = tSteam_x10;
+  clean_tStandby_x10 = tStandby_x10;
+
+  currentMode = MODE_CLEAN;
+  systemStatus = SYS_ACTIVE;
+  activeOp = OP_CLEAN_NB;
+  opBusy = true; abortRequested = false;
+  opStartMs = millis();
+
+  // Phase 0: Valve (M1_Fwd)
+  M1_Fwd(); solenoidOff();
+  cleanPhase = 0;
+  opPhaseEndMs = opStartMs + sec10_to_ms(clean_tValve_x10);
+  logBegin_CLEAN(clean_tValve_x10, clean_tSteam_x10, clean_tStandby_x10);
+}
+
+/* Phase helpers (complete op with status) */
+static void finishOpSuccess(const __FlashStringHelper* tag){
+  solenoidOff();
+  standbyDrive();                  // STANDBY = M1_FWD + M2_REV
+  currentMode = MODE_STANDBY;
+
+  systemStatus = SYS_IDLE;
+  opBusy = false; activeOp = OP_NONE; cleanPhase = 0;
+
+  uint16_t elap_x10 = (uint16_t)(((millis()-opStartMs)+50)/100);
   regWrite(0x0105, elap_x10);
-  regWrite(0x0106, 0); regWrite(0x0107, 0);
-  regWrite(0x0108, 0); regWrite(0x0109, 0); regWrite(0x010A, 0);
+
+  logEnd(tag);
 }
 
-/* ========================= Mode engines =============================== */
-bool pollDuringRun(uint16_t pollMs = 5){
-  unsigned long start = millis();
-  while (millis() - start < pollMs){ delay(1); }
-  return g_abort;
+// Adjusted: only force OFF/Hi-Z for non-ABORT faults
+static void finishOpFault(SystemStatus st, const __FlashStringHelper* tag){
+  if (st != SYS_ABORTED_FAULT) {
+    allOutputsSafe();              // TIMEOUT and others → OFF/Hi-Z posture
+  } // else keep ABORT posture set in abortNow() (STANDBY/idle)
+
+  systemStatus = st;
+  opBusy = false; activeOp = OP_NONE; cleanPhase = 0;
+
+  uint16_t elap_x10 = (uint16_t)(((millis()-opStartMs)+50)/100);
+  regWrite(0x0105, elap_x10);
+
+  logEnd(tag);
 }
 
-void modeInit(float seconds){
-  g_isBusy = true; g_abort = false; g_currentMode = MODE_INIT; systemStatus = SYS_ACTIVE;
-  g_errorMask = 0; g_lastElapsedMs = 0; unsigned long t0 = millis();
-  Serial.println(F("[run] INIT begin"));
-  solenoidOff(); M2_Rev();
-  unsigned long dur = secToMs(seconds);
-  while (!g_abort && (millis() - t0 < dur)) pollDuringRun(10);
-  g_lastElapsedMs = millis() - t0;
-  if (g_abort){ g_errorMask |= (1<<1); Serial.println(F("[run] INIT aborted")); toOff(); systemStatus = SYS_IDLE; }
-  else { Serial.println(F("[run] INIT done")); toStandby(); systemStatus = SYS_IDLE; }
-  g_isBusy = false;
-}
+static void pumpCore(){
+  // keep temp cache fresh
+  float c; (void)tc_tryReadC_nonblocking(c);
 
-void modeFroth(float targetC, float timeoutSec){
-  g_isBusy = true; g_abort = false; g_currentMode = MODE_FROTH; systemStatus = SYS_ACTIVE;
-  g_errorMask = 0; g_lastElapsedMs = 0; unsigned long t0 = millis();
-  Serial.println(F("[run] FROTH begin"));
-  solenoidOff(); M2_Rev();
-  unsigned long tout = secToMs(timeoutSec);
-  while (!g_abort){
-    float c; bool ok = tc_readC_blocking(c);
-    if (!ok){ g_errorMask |= (1<<0); systemStatus = SYS_SCALE_FAULT; Serial.println(F("[err] TC open/fault")); break; }
-    if (c >= targetC){ Serial.println(F("[run] FROTH reached target")); break; }
-    if (millis() - t0 > tout){ g_errorMask |= (1<<2); systemStatus = SYS_TIMEOUT_FAULT; Serial.println(F("[err] FROTH timeout")); break; }
-    pollDuringRun(5);
+  if (activeOp == OP_NONE) return;
+
+  // ABORT preemption
+  if (abortRequested){
+    finishOpFault(SYS_ABORTED_FAULT, F("ABORTED_DURING_OP"));
+    return;
   }
-  g_lastElapsedMs = millis() - t0;
-  if (g_abort){ g_errorMask |= (1<<1); Serial.println(F("[run] FROTH aborted")); toOff(); systemStatus = SYS_IDLE; }
-  else if (systemStatus == SYS_ACTIVE) { Serial.println(F("[run] FROTH done→STANDBY")); toStandby(); systemStatus = SYS_IDLE; }
-  g_isBusy = false;
-}
 
-void modeClean(float tValve, float tSteam, float tStandby){
-  g_isBusy = true; g_abort = false; g_currentMode = MODE_CLEAN; systemStatus = SYS_ACTIVE;
-  g_errorMask = 0; g_lastElapsedMs = 0; unsigned long t0 = millis();
-  Serial.println(F("[run] CLEAN begin"));
+  unsigned long now = millis();
 
-  M1_Fwd();
-  { unsigned long t1=millis(), dur=secToMs(tValve); while(!g_abort && (millis()-t1<dur)) pollDuringRun(5); }
-  if (g_abort){ g_errorMask |= (1<<1); Serial.println(F("[run] CLEAN aborted@phase0")); toOff(); g_isBusy=false; g_lastElapsedMs = millis()-t0; systemStatus = SYS_IDLE; return; }
-  solenoidOn();
+  switch (activeOp){
+    case OP_INIT_NB: {
+      if ((long)(now - opPhaseEndMs) >= 0){
+        finishOpSuccess(F("INIT_DONE"));
+      }
+    } break;
 
-  { unsigned long t2=millis(), dur=secToMs(tSteam); while(!g_abort && (millis()-t2<dur)) pollDuringRun(5); }
-  if (g_abort){ g_errorMask |= (1<<1); Serial.println(F("[run] CLEAN aborted@phase1")); toOff(); g_isBusy=false; g_lastElapsedMs = millis()-t0; systemStatus = SYS_IDLE; return; }
-  solenoidOff(); M2_Rev();
+    case OP_FROTH_NB: {
+      if (tempOk){
+        long curCx10 = lroundf(tempC * 10.0f);
+        if ((long)curCx10 >= (long)targetC_x10){
+          solenoidOff();
+          standbyDrive();          // STANDBY after success
+          currentMode = MODE_STANDBY;
+          systemStatus = SYS_IDLE;
+          opBusy = false; activeOp = OP_NONE; cleanPhase = 0;
+          uint16_t elap_x10 = (uint16_t)(((now - opStartMs)+50)/100);
+          regWrite(0x0105, elap_x10);
+          logEnd_FrothTargetReached(tempC);
+          break;
+        }
+      }
+      if ((long)(now - opPhaseEndMs) >= 0){
+        finishOpFault(SYS_TIMEOUT_FAULT, F("FROTH_TIMEOUT"));
+        break;
+      }
+    } break;
 
-  { unsigned long t3=millis(), dur=secToMs(tStandby); while(!g_abort && (millis()-t3<dur)) pollDuringRun(5); }
+    case OP_CLEAN_NB: {
+      if (cleanPhase == 0){
+        if ((long)(now - opPhaseEndMs) >= 0){
+          // Phase 1: Steam
+          solenoidOn();
+          cleanPhase = 1;
+          opPhaseEndMs = now + sec10_to_ms(clean_tSteam_x10);
+          logBegin_CLEAN_P1(clean_tSteam_x10);
+        }
+      } else if (cleanPhase == 1){
+        if ((long)(now - opPhaseEndMs) >= 0){
+          // Phase 2: Standby
+          solenoidOff(); M2_Rev();
+          cleanPhase = 2;
+          opPhaseEndMs = now + sec10_to_ms(clean_tStandby_x10);
+          logBegin_CLEAN_P2(clean_tStandby_x10);
+        }
+      } else { // phase 2
+        if ((long)(now - opPhaseEndMs) >= 0){
+          finishOpSuccess(F("CLEAN_DONE"));
+        }
+      }
+    } break;
 
-  g_lastElapsedMs = millis() - t0;
-  if (g_abort){ g_errorMask |= (1<<1); Serial.println(F("[run] CLEAN aborted@phase2")); toOff(); systemStatus = SYS_IDLE; }
-  else { Serial.println(F("[run] CLEAN done→STANDBY")); toStandby(); systemStatus = SYS_IDLE; }
-  g_isBusy = false;
-}
-
-/* ========================= ABORT behavior ============================= */
-void doAbort(){
-  Serial.println(F("[api] ABORT requested"));
-  if (g_isBusy){ g_abort = true; while (g_isBusy) { delay(1); } }
-  toOff(); systemStatus = SYS_IDLE; logSnapshot(F("ABORTED_TO_MANUAL"));
+    default: break;
+  }
 }
 
 /* ========================= Executor (0x17 API) ======================= */
 static void executeOpcode(uint16_t opcode, uint16_t seq){
-  unsigned long opStart = millis();
+  // Only TIMEOUT/ABORTED are considered fault latches that block new ops
+  bool hasFault =
+    (systemStatus == SYS_TIMEOUT_FAULT) ||
+    (systemStatus == SYS_ABORTED_FAULT);
 
-  if (g_isBusy && !(opcode==OP_STATUS || opcode==OP_ABORT)){
-    logApiBusyReject(opcode);
+  if (hasFault && !(opcode == OP_CLEAR || opcode == OP_ABORT || opcode == OP_STATUS || opcode == OP_OFF)){
+    buildResult(RC_FAIL, seq, faultToApiError(systemStatus));
+    return;
+  }
+
+  if (opBusy && !(opcode == OP_STATUS || opcode == OP_ABORT || opcode == OP_OFF)){
     buildResult(RC_FAIL, seq, AE_BUSY);
     return;
   }
 
-  logApiStart(opcode);
-
   switch (opcode){
     case OP_STATUS: {
-      float c; (void)tc_tryReadC_nonblocking(c);
       buildResult(RC_OK, seq, AE_NONE);
-      logSnapshot(F("STATUS"));
-      logApiDone(opcode, RC_OK, AE_NONE, millis()-opStart);
+    } break;
+
+    case OP_CLEAR: {
+      clearSystem();
+      buildResult(RC_OK, seq, AE_NONE);
     } break;
 
     case OP_ABORT: {
-      doAbort();
-      buildResult(RC_OK, seq, AE_NONE);
-      logApiDone(opcode, RC_OK, AE_NONE, millis()-opStart);
+      abortNow();
+      buildResult(RC_FAIL, seq, AE_ABORTED);
+    } break;
+
+    case OP_OFF: {
+      offNow();
+      buildResult(RC_OK, seq, AE_NONE);   // systemStatus now SYS_OFF
     } break;
 
     case OP_INIT: {
-      float secs = ((int32_t)regRead(0x0002))/100.0f;
-      if (secs <= 0){ buildResult(RC_FAIL, seq, AE_BAD_ARGS); logApiDone(opcode, RC_FAIL, AE_BAD_ARGS, millis()-opStart); break; }
-      logApiArgs_INIT(secs);
-      modeInit(secs);
-      uint16_t err = currentApiError();
-      uint16_t rc  = (err==AE_NONE && !(g_errorMask & ((1<<0)|(1<<2)))) ? RC_OK : RC_FAIL;
-      buildResult(rc, seq, rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD));
-      logApiDone(opcode, rc, (rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD)), millis()-opStart);
+      uint16_t seconds_x10 = regRead(0x0002);
+      if (seconds_x10 == 0){
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
+        break;
+      }
+      startInitSeconds(seconds_x10);
+      if (opBusy || systemStatus == SYS_ACTIVE){
+        buildResult(RC_OK, seq, AE_NONE); // accepted; completes asynchronously
+      } else {
+        uint16_t err = faultToApiError(systemStatus);
+        buildResult(RC_FAIL, seq, err ? err : AE_INVALID_CMD);
+      }
     } break;
 
     case OP_FROTH: {
-      float targetC   = ((int32_t)regRead(0x0002))/100.0f;
-      float timeout_s = ((int32_t)regRead(0x0003))/100.0f;
-      if (timeout_s <= 0){ buildResult(RC_FAIL, seq, AE_BAD_ARGS); logApiDone(opcode, RC_FAIL, AE_BAD_ARGS, millis()-opStart); break; }
-      logApiArgs_FROTH(targetC, timeout_s);
-      modeFroth(targetC, timeout_s);
-      uint16_t err = currentApiError();
-      uint16_t rc  = (err==AE_NONE && !(g_errorMask & ((1<<0)|(1<<2)))) ? RC_OK : RC_FAIL;
-      buildResult(rc, seq, rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD));
-      logApiDone(opcode, rc, (rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD)), millis()-opStart);
+      uint16_t tgtCx10 = regRead(0x0002);
+      uint16_t tout_x10 = regRead(0x0003);
+      if (tout_x10 == 0){
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
+        break;
+      }
+      startFroth(tgtCx10, tout_x10);
+      if (opBusy || systemStatus == SYS_ACTIVE){
+        buildResult(RC_OK, seq, AE_NONE);
+      } else {
+        uint16_t err = faultToApiError(systemStatus);
+        buildResult(RC_FAIL, seq, err ? err : AE_INVALID_CMD);
+      }
     } break;
 
     case OP_CLEAN: {
-      float tValve   = ((int32_t)regRead(0x0002))/100.0f;
-      float tSteam   = ((int32_t)regRead(0x0003))/100.0f;
-      float tStandby = ((int32_t)regRead(0x0004))/100.0f;
-      if (tValve<0 || tSteam<0 || tStandby<0){ buildResult(RC_FAIL, seq, AE_BAD_ARGS); logApiDone(opcode, RC_FAIL, AE_BAD_ARGS, millis()-opStart); break; }
-      logApiArgs_CLEAN(tValve, tSteam, tStandby);
-      modeClean(tValve, tSteam, tStandby);
-      uint16_t err = currentApiError();
-      uint16_t rc  = (err==AE_NONE && !(g_errorMask & ((1<<0)|(1<<2)))) ? RC_OK : RC_FAIL;
-      buildResult(rc, seq, rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD));
-      logApiDone(opcode, rc, (rc==RC_OK?AE_NONE:(err?err:AE_INVALID_CMD)), millis()-opStart);
+      uint16_t tValve_x10   = regRead(0x0002);
+      uint16_t tSteam_x10   = regRead(0x0003);
+      uint16_t tStandby_x10 = regRead(0x0004);
+      if (tValve_x10==0 && tSteam_x10==0 && tStandby_x10==0){
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
+        break;
+      }
+      startClean(tValve_x10, tSteam_x10, tStandby_x10);
+      if (opBusy || systemStatus == SYS_ACTIVE){
+        buildResult(RC_OK, seq, AE_NONE);
+      } else {
+        uint16_t err = faultToApiError(systemStatus);
+        buildResult(RC_FAIL, seq, err ? err : AE_INVALID_CMD);
+      }
     } break;
 
     default:
       buildResult(RC_FAIL, seq, AE_INVALID_CMD);
-      logApiDone(opcode, RC_FAIL, AE_INVALID_CMD, millis()-opStart);
       break;
   }
 }
 
 /* ========================= Modbus 0x17 frame proc ===================== */
-void modbus_process_0x17(uint8_t* frame, uint16_t len){
+static void process0x17(uint8_t* frame, uint16_t len){
   uint8_t addr = frame[0];
   uint8_t func = frame[1];
-  if (addr != SLAVE_ID){ return; }
+  if (addr != MODBUS_SLAVE_ID){ return; }
   if (func != 0x17){ mb_send_exc(addr, func, 0x01); return; }
+
+  if (len < 13){ return; } // minimum header + CRC already checked by caller
 
   uint16_t readStart  = (uint16_t)((frame[2]<<8) | frame[3]);
   uint16_t readQty    = (uint16_t)((frame[4]<<8) | frame[5]);
@@ -494,15 +710,13 @@ void modbus_process_0x17(uint8_t* frame, uint16_t len){
   uint16_t opcode = regRead(0x0000);
   uint16_t seq    = regRead(0x0001);
 
-  if (g_isBusy && !(opcode==OP_STATUS || opcode==OP_ABORT)){
-    logApiBusyReject(opcode);
-    buildResult(RC_FAIL, seq, AE_BUSY);
-  } else {
-    executeOpcode(opcode, seq);
-  }
+  apiBusy = true;
+  executeOpcode(opcode, seq);
+  apiBusy = false;
 
   const uint16_t respBytes = (uint16_t)(readQty*2);
-  uint16_t pdulen = 3 + respBytes; uint8_t* pdu = (uint8_t*)malloc(pdulen); if (!pdu) return;
+  uint16_t pdulen = 2 + respBytes;                  // func + byteCount + data
+  uint8_t* pdu = (uint8_t*)malloc(pdulen); if (!pdu) return;
   pdu[0] = func; pdu[1] = (uint8_t)respBytes;
   for (uint16_t i=0;i<readQty;i++){
     uint16_t v = regRead(readStart + i);
@@ -513,48 +727,113 @@ void modbus_process_0x17(uint8_t* frame, uint16_t len){
 }
 
 /* ========================= Gap-based poller =========================== */
-void modbusPoll(){
+void handleModbus(){
   static uint8_t  rxBuf[260];
   static uint16_t rxLen = 0; static unsigned long lastByteUs = 0;
+
   while (MODBUS_PORT.available()){
-    int b = MODBUS_PORT.read(); if (b < 0) break; if (rxLen < sizeof(rxBuf)) rxBuf[rxLen++] = (uint8_t)b; lastByteUs = micros();
+    int b = MODBUS_PORT.read(); if (b < 0) break;
+    if (rxLen < sizeof(rxBuf)) rxBuf[rxLen++] = (uint8_t)b;
+    lastByteUs = micros();
   }
   if (rxLen > 0){
     unsigned long gap = micros() - lastByteUs;
     if (gap >= MB_T3P5_US){
-      if (rxLen >= 5){ uint16_t crcCalc = mb_crc16(rxBuf, (uint16_t)(rxLen-2)); uint16_t crcRx = (uint16_t)(rxBuf[rxLen-2] | (rxBuf[rxLen-1]<<8)); if (crcCalc == crcRx){ modbus_process_0x17(rxBuf, rxLen); } }
+      if (rxLen >= 5){
+        uint16_t crcCalc = mb_crc16(rxBuf, (uint16_t)(rxLen-2));
+        uint16_t crcRx = (uint16_t)(rxBuf[rxLen-2] | (uint16_t)(rxBuf[rxLen-1]<<8));
+        if (crcCalc == crcRx){
+          process0x17(rxBuf, rxLen);
+        }
+      }
       rxLen = 0;
     }
   }
 }
 
 /* ========================= CLI helpers (USB) ========================== */
-void printStatusBlocking_USB(){
-  Serial.print(F("Mode=")); Serial.print(modeName(g_currentMode));
-  Serial.print(F(" | Busy=")); Serial.print(g_isBusy?F("YES"):F("NO"));
-  float c; bool ok = tc_readC_blocking(c);
-  Serial.print(F(" | Temp=")); if(ok){ Serial.print(c,2); Serial.print(F(" C")); } else Serial.print(F("fault/open"));
-  Serial.print(F(" | Motors=")); Serial.print(g_motorsEnabled?F("EN"):F("HZ"));
-  Serial.print(F(" | Sys=")); Serial.println(sysName(systemStatus));
-}
-
 void printHelp(){
   Serial.println(F("Commands:"));
   Serial.println(F("  help"));
   Serial.println(F("  status"));
+  Serial.println(F("  clear"));
   Serial.println(F("  abort"));
-  Serial.println(F("  init <seconds>"));
-  Serial.println(F("  froth <targetC> <timeout_s>"));
-  Serial.println(F("  clean <tValve_s> <tSteam_s> <tStandby_s>"));
+  Serial.println(F("  off"));
+  Serial.println(F("  init  <seconds>            (×10 scaling: e.g. 2.5 -> 2.5)"));
+  Serial.println(F("  froth <targetC> <timeout_s>(×10 scaling)"));
+  Serial.println(F("  clean <tValve> <tSteam> <tStandby>  (×10 scaling)"));
 }
 
 void execCliOpcode(uint16_t opcode){
-  // Directly reuse executor path for consistent logs
   executeOpcode(opcode, /*seq*/0);
 }
 
 String readLineNonBlocking_USB(){
-  static String buf; while (Serial.available()){ char ch=(char)Serial.read(); if (ch=='\r') continue; if (ch=='\n'){ String out=buf; buf=""; out.trim(); return out; } buf += ch; } return String();
+  static String buf; while (Serial.available()){ char ch=(char)Serial.read(); if (ch=='\r') continue; if (ch=='\n'){ String out=buf; buf=""; out.trim(); return out; } if (buf.length()<120) buf += ch; } return String();
+}
+
+// Pretty USB printout for STATUS (CLI)
+void printStatusBlocking_USB(){
+  Serial.print(F("Sys=")); Serial.print(systemStatusStr());
+  Serial.print(F(" | Busy=")); Serial.print(opBusy ? F("YES") : F("NO"));
+  Serial.print(F(" | Mode="));
+  switch (currentMode){
+    case MODE_OFF:     Serial.print(F("OFF")); break;
+    case MODE_STANDBY: Serial.print(F("STANDBY")); break;
+    case MODE_INIT:    Serial.print(F("INIT")); break;
+    case MODE_FROTH:   Serial.print(F("FROTH")); break;
+    case MODE_CLEAN:   Serial.print(F("CLEAN")); break;
+  }
+  Serial.print(F(" | Temp="));
+  if (tempOk && isfinite(tempC)) { Serial.print(tempC, 1); Serial.print(F(" C")); }
+  else                           { Serial.print(F("invalid/open")); }
+  Serial.println();
+}
+
+void handleCli(){
+  String cmd = readLineNonBlocking_USB();
+  if (!cmd.length()) return;
+  String lower = cmd; lower.toLowerCase(); lower.trim();
+
+  if (lower == "help"){ printHelp(); }
+  else if (lower == "status"){
+    execCliOpcode(OP_STATUS);
+    printStatusBlocking_USB();
+  }
+  else if (lower == "clear"){ execCliOpcode(OP_CLEAR); }
+  else if (lower == "abort"){ execCliOpcode(OP_ABORT); }
+  else if (lower == "off"){ execCliOpcode(OP_OFF); }
+  else if (lower.startsWith("init ")){
+    float secs = lower.substring(5).toFloat();
+    uint16_t sx10 = (uint16_t)lroundf(secs * 10.0f);
+    regWrite(0x0000, OP_INIT); regWrite(0x0001, 0); regWrite(0x0002, sx10);
+    executeOpcode(OP_INIT, 0);
+  }
+  else if (lower.startsWith("froth ")){
+    int sp = lower.indexOf(' ', 6); if (sp<0){ Serial.println(F("Use: froth <targetC> <timeout_s>")); return; }
+    float targetC = lower.substring(6, sp).toFloat();
+    float tout    = lower.substring(sp+1).toFloat();
+    regWrite(0x0000, OP_FROTH); regWrite(0x0001, 0);
+    regWrite(0x0002, (uint16_t)lroundf(targetC*10.0f));
+    regWrite(0x0003, (uint16_t)lroundf(tout*10.0f));
+    executeOpcode(OP_FROTH, 0);
+  }
+  else if (lower.startsWith("clean ")){
+    String rest = lower.substring(6); rest.trim();
+    int s1 = rest.indexOf(' '); if (s1<0){ Serial.println(F("Use: clean <tValve> <tSteam> <tStandby>")); return; }
+    int s2 = rest.indexOf(' ', s1+1); if (s2<0){ Serial.println(F("Use: clean <tValve> <tSteam> <tStandby>")); return; }
+    float tValve = rest.substring(0, s1).toFloat();
+    float tSteam = rest.substring(s1+1, s2).toFloat();
+    float tStby  = rest.substring(s2+1).toFloat();
+    regWrite(0x0000, OP_CLEAN); regWrite(0x0001, 0);
+    regWrite(0x0002, (uint16_t)lroundf(tValve*10.0f));
+    regWrite(0x0003, (uint16_t)lroundf(tSteam*10.0f));
+    regWrite(0x0004, (uint16_t)lroundf(tStby*10.0f));
+    executeOpcode(OP_CLEAN, 0);
+  }
+  else {
+    Serial.println(F("Unknown command. Type 'help'."));
+  }
 }
 
 /* ========================= Setup / Loop =============================== */
@@ -571,55 +850,14 @@ void setup(){
   MODBUS_PORT.begin(MODBUS_BAUD, MODBUS_CONFIG);
   memset(regSpace, 0, sizeof(regSpace));
 
-  Serial.println(F("=== Steam Wand Modbus RTU (v1.6 | single-shot 0x17) ==="));
-  Serial.println(F("Opcodes: STATUS(1) ABORT(2) INIT(10) FROTH(11) CLEAN(12)"));
+  Serial.println(F("=== Steam Wand Modbus RTU (v2.3+ | OFF status; ABORT→IDLE posture) ==="));
+  Serial.println(F("Opcodes: STATUS(1) CLEAR(2) ABORT(3) OFF(4) INIT(10) FROTH(11) CLEAN(12)"));
   Serial.println(F("Boot: manual-control (L298 inputs Hi-Z; external pull-downs required)"));
   Serial.println(F("Type 'help' for CLI."));
 }
 
 void loop(){
-  modbusPoll();
-  float c; (void)tc_tryReadC_nonblocking(c); // keep cache fresh
-
-  String cmd = readLineNonBlocking_USB();
-  if (cmd.length()){
-    String lower = cmd; lower.toLowerCase(); lower.trim();
-    if (lower == "help"){ printHelp(); }
-    else if (lower == "status"){ execCliOpcode(OP_STATUS); printStatusBlocking_USB(); }
-    else if (lower == "abort"){ execCliOpcode(OP_ABORT); }
-    else if (lower.startsWith("init ")){
-      float secs = lower.substring(5).toFloat();
-      regWrite(0x0000, OP_INIT); regWrite(0x0001, 0); regWrite(0x0002, (uint16_t)lroundf(secs*100.0f));
-      executeOpcode(OP_INIT, 0);
-    }
-    else if (lower.startsWith("froth ")){
-      int sp = lower.indexOf(' ', 6); if (sp<0){ Serial.println(F("Use: froth <targetC> <timeout_s>")); }
-      else {
-        float targetC = lower.substring(6, sp).toFloat();
-        float tout = lower.substring(sp+1).toFloat();
-        regWrite(0x0000, OP_FROTH); regWrite(0x0001, 0);
-        regWrite(0x0002, (uint16_t)lroundf(targetC*100.0f));
-        regWrite(0x0003, (uint16_t)lroundf(tout*100.0f));
-        executeOpcode(OP_FROTH, 0);
-      }
-    }
-    else if (lower.startsWith("clean ")){
-      // clean <tValve> <tSteam> <tStandby>
-      String rest = lower.substring(6); rest.trim();
-      int s1 = rest.indexOf(' '); if (s1<0){ Serial.println(F("Use: clean <tValve_s> <tSteam_s> <tStandby_s>")); goto _end; }
-      int s2 = rest.indexOf(' ', s1+1); if (s2<0){ Serial.println(F("Use: clean <tValve_s> <tSteam_s> <tStandby_s>")); goto _end; }
-      float tValve = rest.substring(0, s1).toFloat();
-      float tSteam = rest.substring(s1+1, s2).toFloat();
-      float tStby  = rest.substring(s2+1).toFloat();
-      regWrite(0x0000, OP_CLEAN); regWrite(0x0001, 0);
-      regWrite(0x0002, (uint16_t)lroundf(tValve*100.0f));
-      regWrite(0x0003, (uint16_t)lroundf(tSteam*100.0f));
-      regWrite(0x0004, (uint16_t)lroundf(tStby*100.0f));
-      executeOpcode(OP_CLEAN, 0);
-    }
-    else {
-      Serial.println(F("Unknown command. Type 'help'."));
-    }
-  }
-_end:;
+  handleModbus();   // non-blocking, gap-based
+  pumpCore();       // advance active operation
+  handleCli();      // USB CLI
 }
