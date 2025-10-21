@@ -793,7 +793,7 @@ void loop() {
             String ssoft   = sto.substring(0, sp4); ssoft.trim();
             String stime   = sto.substring(sp4+1); stime.trim();
 
-            int pin; char nm[16];
+            int pin; const char* nm;
             if (!parseMotorSelector(smotor, pin, nm, sizeof(nm))) { Serial.println(F("Unknown motor.")); break; }
 
             float grams = starget.toFloat();
@@ -839,7 +839,7 @@ static void rs485RxMode() {
 static void rs485TxMode() {
   digitalWrite(RS485_RE_PIN, HIGH);  // disable receiver during TX
   digitalWrite(RS485_DE_PIN, HIGH);  // enable driver
-  delayMicroseconds(4);              // turnaround guard
+  delayMicroseconds(150);            // turnaround guard (more conservative; MAX485-friendly)
 }
 
 // Read/Write 16-bit big-endian helpers for register image
@@ -1000,134 +1000,132 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
   }
 }
 
-// Core Modbus 0x17 handler (single transaction)
+// ===================== Gap-based Modbus 0x17 handler (non-blocking RX) =====================
 static void handleModbus() {
   if (apiBusy) return;
 
-  if (MODBUS_SERIAL.available() < 12) return;
+  static uint8_t  rxBuf[260];
+  static uint16_t rxLen = 0;
+  static unsigned long lastByteUs = 0;
 
-  uint8_t hdr[12];
-  for (uint8_t i=0;i<12;i++) {
+  // Ingest any available bytes
+  while (MODBUS_SERIAL.available()) {
     int b = MODBUS_SERIAL.read();
-    if (b < 0) return;
-    hdr[i] = (uint8_t)b;
+    if (b < 0) break;
+    if (rxLen < sizeof(rxBuf)) rxBuf[rxLen++] = (uint8_t)b;
+    lastByteUs = micros();
   }
 
-  uint8_t addr = hdr[0];
-  uint8_t func = hdr[1];
-  if (addr != MODBUS_SLAVE_ID) {
-    return;
-  }
+  // If we have bytes and we've seen a T3.5 gap, treat it as a frame boundary
+  if (rxLen > 0) {
+    unsigned long gap = micros() - lastByteUs;
+    if (gap >= MB_T3P5_US) {
+      // Minimum Modbus RTU frame: addr(1) + func(1) + crc(2) = 4 bytes
+      if (rxLen >= 5) {
+        // CRC check
+        uint16_t crcCalc = mb_crc16(rxBuf, (uint16_t)(rxLen - 2));
+        uint16_t crcRx   = (uint16_t)(rxBuf[rxLen - 2] | ((uint16_t)rxBuf[rxLen - 1] << 8));
+        if (crcCalc == crcRx) {
+          uint8_t addr = rxBuf[0];
+          uint8_t func = rxBuf[1];
 
-  if (func != 0x17) {
-    uint8_t resp[5];
-    resp[0]=addr; resp[1]=func|0x80; resp[2]=0x01;
-    uint16_t crc = mb_crc16(resp,3);
-    resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
-    delayMicroseconds(MB_T3P5_US);
-    rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
-    return;
-  }
+          if (addr == MODBUS_SLAVE_ID) {
+            if (func != 0x17) {
+              // Exception: Illegal Function
+              uint8_t resp[5];
+              resp[0] = addr; resp[1] = (uint8_t)(func | 0x80); resp[2] = 0x01;
+              uint16_t ecrc = mb_crc16(resp, 3);
+              resp[3] = (uint8_t)(ecrc & 0xFF); resp[4] = (uint8_t)(ecrc >> 8);
+              delayMicroseconds(MB_T3P5_US);
+              rs485TxMode(); MODBUS_SERIAL.write(resp, 5); MODBUS_SERIAL.flush(); rs485RxMode();
+            } else {
+              // Expect: total length = 13 + writeBytes
+              if (rxLen >= 13) {
+                uint16_t readStart  = (uint16_t)((rxBuf[2] << 8) | rxBuf[3]);
+                uint16_t readQty    = (uint16_t)((rxBuf[4] << 8) | rxBuf[5]);
+                uint16_t writeStart = (uint16_t)((rxBuf[6] << 8) | rxBuf[7]);
+                uint16_t writeQty   = (uint16_t)((rxBuf[8] << 8) | rxBuf[9]);
+                uint8_t  writeBytes = rxBuf[10];
 
-  uint16_t readStart    = (uint16_t)((hdr[2]<<8) | hdr[3]);
-  uint16_t readQty      = (uint16_t)((hdr[4]<<8) | hdr[5]);
-  uint16_t writeStart   = (uint16_t)((hdr[6]<<8) | hdr[7]);
-  uint16_t writeQty     = (uint16_t)((hdr[8]<<8) | hdr[9]);
-  uint8_t  writeBytes   = hdr[10];
+                // Validate write byte count
+                if (writeBytes != (uint8_t)(writeQty * 2)) {
+                  uint8_t ex[5];
+                  ex[0] = addr; ex[1] = (uint8_t)(func | 0x80); ex[2] = 0x03; // Illegal data value
+                  uint16_t ecrc = mb_crc16(ex, 3);
+                  ex[3] = (uint8_t)(ecrc & 0xFF); ex[4] = (uint8_t)(ecrc >> 8);
+                  delayMicroseconds(MB_T3P5_US);
+                  rs485TxMode(); MODBUS_SERIAL.write(ex, 5); MODBUS_SERIAL.flush(); rs485RxMode();
+                } else {
+                  uint16_t expectedLen = (uint16_t)(13 + writeBytes);
+                  if (rxLen == expectedLen) {
+                    // Write data begin at byte 11 (as per original handler logic)
+                    const uint8_t* writeData = rxBuf + 11;
+                    for (uint16_t i = 0; i < writeQty; i++) {
+                      uint16_t val = (uint16_t)((writeData[2 * i] << 8) | writeData[2 * i + 1]);
+                      regWrite((uint16_t)(writeStart + i), val);
+                    }
 
-  if (writeBytes != (uint8_t)(writeQty*2)) {
-    uint8_t resp[5];
-    resp[0]=addr; resp[1]=func|0x80; resp[2]=0x03;
-    uint16_t crc = mb_crc16(resp,3);
-    resp[3]=(uint8_t)(crc & 0xFF); resp[4]=(uint8_t)(crc>>8);
-    delayMicroseconds(MB_T3P5_US);
-    rs485TxMode(); MODBUS_SERIAL.write(resp,5); MODBUS_SERIAL.flush(); rs485RxMode();
-    return;
-  }
+                    uint16_t opcode = regRead(0x0000);
+                    uint16_t seq    = regRead(0x0001);
 
-  uint16_t totalLen = 13 + writeBytes;
-  while (MODBUS_SERIAL.available() < (totalLen - 12)) { /* wait */ }
+                    bool busyNow = (state == ST_DISPENSING) || rinseActive || diagTriggerActive;
 
-  const uint16_t restLen = totalLen - 12;
-  uint8_t rest[256];
-  for (uint16_t i=0;i<restLen;i++) {
-    int b = MODBUS_SERIAL.read();
-    if (b < 0) return;
-    rest[i] = (uint8_t)b;
-  }
+                    if (busyNow) {
+                      if (opcode == OP_ABORT || opcode == OP_STATUS) {
+                        apiBusy = true; executeOpcode(opcode, seq); apiBusy = false;
+                      } else {
+                        buildResult(RC_FAIL, seq, AE_BUSY);
+                      }
+                    } else {
+                      apiBusy = true; executeOpcode(opcode, seq); apiBusy = false;
+                    }
 
-  uint8_t full[12+restLen];
-  memcpy(full, hdr, 12);
-  memcpy(full+12, rest, restLen);
-  uint16_t gotCrc = (uint16_t)(full[totalLen-2] | (full[totalLen-1]<<8));
-  uint16_t calcCrc = mb_crc16(full, totalLen-2);
-  if (gotCrc != calcCrc) {
-    return;
-  }
+                    // Guard max read quantity and send reply
+                    if (readQty > MB_MAX_READ_QTY) {
+                      uint8_t ex[5];
+                      ex[0] = addr; ex[1] = (uint8_t)(func | 0x80); ex[2] = 0x03;
+                      uint16_t ecrc = mb_crc16(ex, 3);
+                      ex[3] = (uint8_t)(ecrc & 0xFF); ex[4] = (uint8_t)(ecrc >> 8);
+                      delayMicroseconds(MB_T3P5_US);
+                      rs485TxMode(); MODBUS_SERIAL.write(ex, 5); MODBUS_SERIAL.flush(); rs485RxMode();
+                    } else {
+                      const uint16_t respBytes = (uint16_t)(readQty * 2);
+                      uint16_t outLen = (uint16_t)(3 + respBytes + 2);
+                      uint8_t* resp = mb_resp_buf;
 
-  const uint8_t* writeData = full + 11; // after writeByteCount
-  for (uint16_t i=0;i<writeQty;i++) {
-    uint16_t val = (uint16_t)((writeData[2*i]<<8) | writeData[2*i+1]);
-    regWrite(writeStart + i, val);
-  }
+                      resp[0] = addr;
+                      resp[1] = func;
+                      resp[2] = (uint8_t)respBytes;
 
-  uint16_t opcode = regRead(0x0000);
-  uint16_t seq    = regRead(0x0001);
+                      for (uint16_t i = 0; i < readQty; i++) {
+                        uint16_t v = regRead((uint16_t)(readStart + i));
+                        resp[3 + 2 * i]     = (uint8_t)(v >> 8);
+                        resp[3 + 2 * i + 1] = (uint8_t)(v & 0xFF);
+                      }
 
-  bool busyNow = (state == ST_DISPENSING) || rinseActive || diagTriggerActive;
+                      uint16_t rcrc = mb_crc16(resp, (uint16_t)(outLen - 2));
+                      resp[outLen - 2] = (uint8_t)(rcrc & 0xFF);
+                      resp[outLen - 1] = (uint8_t)(rcrc >> 8);
 
-  if (busyNow) {
-    if (opcode == OP_ABORT) {
-      apiBusy = true;
-      executeOpcode(opcode, seq);
-      apiBusy = false;
-    } else if (opcode == OP_STATUS) {
-      apiBusy = true;
-      executeOpcode(opcode, seq);
-      apiBusy = false;
-    } else {
-      buildResult(RC_FAIL, seq, AE_BUSY);
+                      rs485TxMode();
+                      MODBUS_SERIAL.write(resp, outLen);
+                      MODBUS_SERIAL.flush();
+                      delayMicroseconds(MB_CHAR_US); // give master time to drop DE
+                      rs485RxMode();
+                    }
+                  }
+                  // else: length mismatch after gap → drop silently (frame error)
+                }
+              }
+              // else: too short for 0x17 → drop silently
+            }
+          }
+          // else: addressed to someone else → ignore
+        }
+        // else: CRC mismatch → drop silently
+      }
+      // Reset buffer after processing or dropping
+      rxLen = 0;
     }
-  } else {
-    apiBusy = true;
-    executeOpcode(opcode, seq);
-    apiBusy = false;
   }
-
-  // ---------- FIX: Use static TX buffer; guard max read qty ----------
-  if (readQty > MB_MAX_READ_QTY) {
-    // Illegal data value
-    uint8_t ex[5];
-    ex[0] = addr; ex[1] = func | 0x80; ex[2] = 0x03;
-    uint16_t ecrc = mb_crc16(ex, 3);
-    ex[3] = (uint8_t)(ecrc & 0xFF); ex[4] = (uint8_t)(ecrc >> 8);
-    delayMicroseconds(MB_T3P5_US);
-    rs485TxMode(); MODBUS_SERIAL.write(ex, 5); MODBUS_SERIAL.flush(); rs485RxMode();
-    return;
-  }
-
-  const uint16_t respBytes = (uint16_t)(readQty * 2);
-  uint16_t outLen = (uint16_t)(3 + respBytes + 2);
-  uint8_t* resp = mb_resp_buf;
-
-  resp[0] = addr;
-  resp[1] = func;
-  resp[2] = (uint8_t)respBytes;
-
-  for (uint16_t i=0;i<readQty;i++) {
-    uint16_t v = regRead((uint16_t)(readStart + i));
-    resp[3 + 2*i]     = (uint8_t)(v >> 8);
-    resp[3 + 2*i + 1] = (uint8_t)(v & 0xFF);
-  }
-
-  uint16_t crc = mb_crc16(resp, (uint16_t)(outLen - 2));
-  resp[outLen-2] = (uint8_t)(crc & 0xFF);
-  resp[outLen-1] = (uint8_t)(crc >> 8);
-
-  rs485TxMode();
-  MODBUS_SERIAL.write(resp, outLen);
-  MODBUS_SERIAL.flush();
-  delayMicroseconds(MB_CHAR_US);     // ~573 µs @19200 — give master time to drop DE
-  rs485RxMode();
-  // ------------------------------------------------------
 }

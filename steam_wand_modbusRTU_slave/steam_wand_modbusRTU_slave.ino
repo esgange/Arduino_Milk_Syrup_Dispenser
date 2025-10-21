@@ -4,8 +4,8 @@
   │ Target MCU: Arduino Nano Every (megaAVR 4809)                            │
   └───────────────────────────────────────────────────────────────────────────┘
 
-  Version : 2.3+
-  Date    : 2025-10-20  (Asia/Riyadh)
+  Version : 2.4 (no-malloc TX + capped readQty)
+  Date    : 2025-10-21  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
   What this firmware does
@@ -16,31 +16,14 @@
   • Boots in manual control (L298 inputs Hi-Z); auto-enables drivers on first use.
   • STANDBY/IDLE posture actively drives M1 forward + M2 reverse.
   • Faults produced: TIMEOUT and ABORTED.
-  • NEW: OFF is a distinct SystemStatus (7). ABORT keeps ABORTED_FAULT status but
-    sets motors to IDLE (STANDBY) posture, not OFF/Hi-Z.
+  • OFF is a distinct SystemStatus (7). ABORT keeps ABORTED_FAULT status but sets
+    motors to IDLE (STANDBY) posture, not OFF/Hi-Z.
 
-  Bus coexistence
-  ───────────────
-  • RS-485 half-duplex; this node uses Slave ID=2, only drives TX when addressed.
-  • DE/RE turnaround guard on TX is generous for MAX485-style transceivers.
-
-  Register map (Holding)
-  ──────────────────────
-    Command Block @ 0x0000 (write before/with 0x17)
-      0x0000  OPCODE: 1=STATUS, 2=CLEAR, 3=ABORT, 4=OFF, 10=INIT, 11=FROTH, 12=CLEAN
-      0x0001  SEQ (echo)
-      0x0002..0x0006  args (×10 scaling for seconds / °C)
-
-    Result Block @ 0x0100 (read in same 0x17)
-      0x0100  RC: 0=OK, 1=FAIL
-      0x0101  ERR: 0=NONE,1=BUSY,2=MOTOR,3=LEAK,4=SCALE,5=TIMEOUT,6=BAD_ARGS,7=INVALID_CMD,8=ABORTED
-               (Only TIMEOUT and ABORTED are produced by this firmware.)
-      0x0102  SYSTEM_STATUS:
-               0=IDLE,1=ACTIVE,5=TIMEOUT_FAULT,6=ABORTED_FAULT,7=OFF   ← NEW OFF
-      0x0103  SEQ echo
-      0x0104  AUX0 = TEMP_C×10  (uint16; 0 if invalid)
-      0x0105  ELAPSED_S×10      (set by ops; ABORT sets immediately)
-      0x0106..0x010A  reserved=0
+  Notes for Modbus master integrators
+  ────────────────────────────────────
+  • This node is Slave ID=2, 19,200 8N1. Half-duplex RS-485.
+  • Only Function 0x17 (Read/Write Multiple Registers) is supported.
+  • Result block is at 0x0100..0x010A (11 regs). Read cap enforced (64 regs).
 */
 
 #include <Arduino.h>
@@ -48,20 +31,23 @@
 #include <math.h>
 
 /* ========================= Compile-time flags ========================= */
-#define HAVE_L298_PULLDOWNS  1   // external pulldowns present on EN/IN lines
+#define HAVE_L298_PULLDOWNS  1
 
 /* ========================= Modbus / RS-485 =========================== */
 #define MODBUS_SLAVE_ID  2
 #define MODBUS_BAUD      19200
 #define MODBUS_CONFIG    SERIAL_8N1
 
-const uint8_t RS485_RE_PIN = A1;  // RE: LOW = RX enable (active-low receiver enable)
-const uint8_t RS485_DE_PIN = A2;  // DE: HIGH = TX enable
+const uint8_t RS485_RE_PIN = A1;
+const uint8_t RS485_DE_PIN = A2;
 #define MODBUS_PORT Serial1
 
-// Conservative 11-bit char timing (ok for MAX485), T3.5 ≈ 2.0 ms @ 19,200
+// 11-bit char timing; T3.5 ≈ 2.0 ms @ 19,200
 const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD;
 const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);
+
+// Cap read size to bound response and avoid dynamic allocation
+#define MB_MAX_READ_QTY 64
 
 /* ========================= Hardware map ============================== */
 const uint8_t SOLENOID_PIN = 2;
@@ -69,8 +55,8 @@ const uint8_t M1_IN1 = 3;
 const uint8_t M1_IN2 = 4;
 const uint8_t M2_IN1 = 5;
 const uint8_t M2_IN2 = 6;
-const uint8_t ENA_PIN = 7;   // L298 ENA (M1)
-const uint8_t ENB_PIN = 8;   // L298 ENB (M2)
+const uint8_t ENA_PIN = 7;
+const uint8_t ENB_PIN = 8;
 
 /* MAX6675 (bit-banged) */
 const uint8_t TC_SO  = 12;
@@ -84,9 +70,9 @@ const unsigned long MAX_TIMEOUT_MS   = 10UL * 60UL * 1000UL;
 enum Mode : uint8_t { MODE_OFF, MODE_STANDBY, MODE_INIT, MODE_FROTH, MODE_CLEAN };
 Mode currentMode = MODE_OFF;
 
-volatile bool apiBusy      = false;   // transaction guard
-volatile bool opBusy       = false;   // true while an operation is active
-volatile bool abortRequested = false; // set by ABORT opcode
+volatile bool apiBusy      = false;
+volatile bool opBusy       = false;
+volatile bool abortRequested = false;
 
 /* Non-blocking operation engine */
 enum ActiveOp : uint8_t { OP_NONE, OP_INIT_NB, OP_FROTH_NB, OP_CLEAN_NB };
@@ -111,13 +97,12 @@ static bool   tempOk  = false;
 
 /* ========================= Result / API =============================== */
 #define REG_SPACE_SIZE   0x0120
-static uint16_t regSpace[REG_SPACE_SIZE]; // holding register image
+static uint16_t regSpace[REG_SPACE_SIZE];
 
 enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 
 enum ApiError : uint16_t {
   AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7, AE_ABORTED=8
-  // NOTE: Only AE_TIMEOUT and AE_ABORTED are emitted by this firmware.
 };
 
 enum Opcode : uint16_t {
@@ -132,7 +117,7 @@ enum SystemStatus : uint16_t {
   SYS_SCALE_FAULT=4,   // never used here
   SYS_TIMEOUT_FAULT=5,
   SYS_ABORTED_FAULT=6,
-  SYS_OFF=7            // NEW: OFF distinct from IDLE
+  SYS_OFF=7            // OFF distinct from IDLE
 };
 volatile SystemStatus systemStatus = SYS_IDLE;
 
@@ -698,15 +683,18 @@ static void process0x17(uint8_t* frame, uint16_t len){
   uint16_t writeQty   = (uint16_t)((frame[8]<<8) | frame[9]);
   uint8_t  writeBytes = frame[10];
 
+  // Sanity checks on write section
   if (writeBytes != (uint8_t)(writeQty*2)){ mb_send_exc(addr, func, 0x03); return; }
   if (len < (uint16_t)(11 + writeBytes + 2)){ return; }
 
+  // Apply writes
   const uint8_t* writeData = frame + 11;
   for (uint16_t i=0;i<writeQty;i++){
     uint16_t val = (uint16_t)((writeData[2*i]<<8) | writeData[2*i+1]);
     if ((uint32_t)(writeStart+i) < REG_SPACE_SIZE) regWrite(writeStart + i, val);
   }
 
+  // Execute command
   uint16_t opcode = regRead(0x0000);
   uint16_t seq    = regRead(0x0001);
 
@@ -714,16 +702,20 @@ static void process0x17(uint8_t* frame, uint16_t len){
   executeOpcode(opcode, seq);
   apiBusy = false;
 
+  // Guard maximum read quantity and build static PDU (no malloc)
+  if (readQty > MB_MAX_READ_QTY){ mb_send_exc(addr, func, 0x03); return; }
+
   const uint16_t respBytes = (uint16_t)(readQty*2);
-  uint16_t pdulen = 2 + respBytes;                  // func + byteCount + data
-  uint8_t* pdu = (uint8_t*)malloc(pdulen); if (!pdu) return;
+  uint16_t pdulen = (uint16_t)(2 + respBytes);     // func + byteCount + data
+
+  static uint8_t pdu[2 + 2*MB_MAX_READ_QTY];
   pdu[0] = func; pdu[1] = (uint8_t)respBytes;
   for (uint16_t i=0;i<readQty;i++){
-    uint16_t v = regRead(readStart + i);
+    uint16_t v = regRead((uint16_t)(readStart + i));
     pdu[2 + 2*i    ] = (uint8_t)(v >> 8);
     pdu[2 + 2*i + 1] = (uint8_t)(v & 0xFF);
   }
-  mb_send_ok(addr, pdu, pdulen); free(pdu);
+  mb_send_ok(addr, pdu, pdulen);
 }
 
 /* ========================= Gap-based poller =========================== */
@@ -759,9 +751,9 @@ void printHelp(){
   Serial.println(F("  clear"));
   Serial.println(F("  abort"));
   Serial.println(F("  off"));
-  Serial.println(F("  init  <seconds>            (×10 scaling: e.g. 2.5 -> 2.5)"));
-  Serial.println(F("  froth <targetC> <timeout_s>(×10 scaling)"));
-  Serial.println(F("  clean <tValve> <tSteam> <tStandby>  (×10 scaling)"));
+  Serial.println(F("  init  <seconds>"));
+  Serial.println(F("  froth <targetC> <timeout_s>"));
+  Serial.println(F("  clean <tValve> <tSteam> <tStandby>"));
 }
 
 void execCliOpcode(uint16_t opcode){
@@ -850,9 +842,8 @@ void setup(){
   MODBUS_PORT.begin(MODBUS_BAUD, MODBUS_CONFIG);
   memset(regSpace, 0, sizeof(regSpace));
 
-  Serial.println(F("=== Steam Wand Modbus RTU (v2.3+ | OFF status; ABORT→IDLE posture) ==="));
+  Serial.println(F("=== Steam Wand Modbus RTU (v2.4 | OFF status; ABORT→IDLE posture; no-malloc TX) ==="));
   Serial.println(F("Opcodes: STATUS(1) CLEAR(2) ABORT(3) OFF(4) INIT(10) FROTH(11) CLEAN(12)"));
-  Serial.println(F("Boot: manual-control (L298 inputs Hi-Z; external pull-downs required)"));
   Serial.println(F("Type 'help' for CLI."));
 }
 
