@@ -13,7 +13,7 @@
   • Single-shot dispense controller with leak monitoring and a Modbus RTU slave API.
   • Exposes minimalist API: STATUS, CLEAR, ABORT, DISPENSE, RINSE, TRIGGER.
   • Accepts only Modbus Function 0x17 (Read/Write Multiple Registers).
-  • Single-transaction model; now non-blocking for DISPENSE/RINSE/TRIGGER to allow ABORT.
+  • Single-transaction model; non-blocking for DISPENSE/RINSE/TRIGGER to allow ABORT.
 */
 
 #include <Arduino.h>
@@ -62,10 +62,8 @@ static uint16_t faultToApiError(uint8_t systemStatus);
 const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD; // ~573 us @19200
 const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);     // ~2.0 ms
 
-// ---------- FIX: Static Modbus TX buffer (eliminate malloc) ----------
-#define MB_MAX_READ_QTY 64  // max 16-bit registers returned in one read (master uses 11)
+#define MB_MAX_READ_QTY  64  // max 16-bit registers returned in one read (master uses 11)
 static uint8_t mb_resp_buf[3 + 2*MB_MAX_READ_QTY + 2];
-// --------------------------------------------------------------------
 
 // ===================== Scale config (variables only) =====================
 const uint8_t MILK_SCALE_ADDR  = 0x2A; // Milk scale address
@@ -131,8 +129,8 @@ int   activeMotorPin = -1;
 char  activeMotorName[16] = "";
 
 uint16_t target_x10        = 0;
-uint16_t softThreshold_x10 = 0;   // absolute threshold in x10 grams (target - softCutOffset)
-uint16_t lowSpeed_x10      = 0;   // absolute threshold in x10 grams (target - slowOffset)
+uint16_t softThreshold_x10 = 0;   // absolute threshold in x10 grams
+uint16_t lowSpeed_x10      = 0;   // absolute threshold in x10 grams
 
 unsigned long timeout_ms   = 30000;
 unsigned long startMs      = 0;
@@ -352,15 +350,17 @@ void printList() {
 }
 
 // ===================== Core dispense logic =====================
-// slowOffset_g -> switch to LOW at target - slowOffset_g
-// softCutOffset_g -> stop motor at target - softCutOffset_g (then settle & coast)
+// slowOffset_g (0..100) -> switch to LOW when weight reaches slowOffset_g% of target
+// softCutOffset_g (0..100) -> 0 => soft cut ~1.5 g before target, 100 => soft cut at target
 void startDispense(int pin, const char* name, float slowOffset_g, float softCutOffset_g, unsigned long timeout_s, uint16_t tgt_x10) {
   if (timeout_s == 0) timeout_s = 30;
   if (timeout_s*1000UL > MAX_TIMEOUT_MS) timeout_s = MAX_TIMEOUT_MS/1000UL;
   timeout_ms = timeout_s * 1000UL;
 
   if (slowOffset_g < 0) slowOffset_g = 0;
+  if (slowOffset_g > 100.0f) slowOffset_g = 100.0f;
   if (softCutOffset_g < 0) softCutOffset_g = 0;
+  if (softCutOffset_g > 100.0f) softCutOffset_g = 100.0f;
 
   activeScale = isMilkPin((uint8_t)pin) ? SCALE_MILK : SCALE_SAUCE;
 
@@ -383,12 +383,20 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
   }
 
   target_x10 = tgt_x10;
+  float target_g = target_x10 / 10.0f;
 
-  // Compute absolute thresholds
-  uint16_t slowOff_x10 = (uint16_t)(slowOffset_g * 10.0f + 0.5f);
-  uint16_t softOff_x10 = (uint16_t)(softCutOffset_g * 10.0f + 0.5f);
+  // Map slowOffset_g (0..100) to absolute low-speed threshold as % of target
+  float slowThreshold_g = (slowOffset_g / 100.0f) * target_g;
+  if (slowThreshold_g < 0.0f) slowThreshold_g = 0.0f;
+  if (slowThreshold_g > target_g) slowThreshold_g = target_g;
+  lowSpeed_x10 = (uint16_t)(slowThreshold_g * 10.0f + 0.5f);
 
-  lowSpeed_x10      = (slowOff_x10 >= target_x10) ? 0 : (uint16_t)(target_x10 - slowOff_x10);
+  // Map softCutOffset_g (0..100) to 0..1.5 g below target
+  const float maxSoftOffset_g = 1.5f;
+  float softOffset_g = maxSoftOffset_g * (1.0f - (softCutOffset_g / 100.0f));
+  if (softOffset_g < 0.0f) softOffset_g = 0.0f;
+  uint16_t softOff_x10 = (uint16_t)(softOffset_g * 10.0f + 0.5f);
+
   softThreshold_x10 = (softOff_x10 >= target_x10) ? 0 : (uint16_t)(target_x10 - softOff_x10);
 
   activeMotorPin = pin;
@@ -418,8 +426,8 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
   state = ST_DISPENSING;
   systemStatus = SYS_ACTIVE;
 
-  if (softThreshold_x10 < lowSpeed_x10) {
-    Serial.println(F("[warn] softCutOffset_g > slowOffset_g: soft-cut will occur before slow-down"));
+  if (softThreshold_x10 < lowSpeed_x10 && softThreshold_x10 != 0) {
+    Serial.println(F("[warn] softCutAt < slowAt: soft cut may occur before slow-down"));
   }
 
   Serial.print(F("[cfg][scale=")); Serial.print(activeScaleName()); Serial.print(F(" id=")); Serial.print(activeScaleId());
@@ -430,8 +438,8 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
 
   Serial.print(F("[dispense] ")); Serial.print(activeMotorName);
   Serial.print(F(" target=")); Serial.print(target_x10/10.0f,1); Serial.print(F(" g"));
-  Serial.print(F(" slowOffset=")); Serial.print(slowOffset_g,1); Serial.print(F(" g"));
-  Serial.print(F(" softCutOffset=")); Serial.print(softCutOffset_g,1); Serial.print(F(" g"));
+  Serial.print(F(" slowPct=")); Serial.print(slowOffset_g,1); Serial.print(F(" %"));
+  Serial.print(F(" softCut=")); Serial.print(softCutOffset_g,1); Serial.print(F(" %"));
   Serial.print(F(" timeout=")); Serial.print(timeout_s);
   Serial.print(F(" [scale=")); Serial.print(activeScaleName()); Serial.print(F(" id=")); Serial.print(activeScaleId());
   Serial.print(F(" addr=0x")); Serial.print(activeScaleAddr(),HEX); Serial.println(F("]"));
@@ -508,7 +516,7 @@ void handleDispensing() {
       return;
     }
 
-    if (lastWeight_x10 >= softThreshold_x10) {
+    if (softThreshold_x10 != 0 && lastWeight_x10 >= softThreshold_x10) {
       stopActiveMotor();
       softCutTriggered = true;
       softStopMs = now;
@@ -736,7 +744,7 @@ void loop() {
             Serial.println(F("  status"));
             Serial.println(F("  clear"));
             Serial.println(F("  abort"));
-            Serial.println(F("  dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>"));
+            Serial.println(F("  dispense <motor> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>"));
             Serial.println(F("  rinse <seconds>"));
             Serial.println(F("  trigger <motor> <seconds>"));
           }
@@ -781,7 +789,7 @@ void loop() {
             int sp1 = rest.indexOf(' ');
             int sp2 = rest.indexOf(' ', sp1+1);
             int sp3 = rest.indexOf(' ', sp2+1);
-            if (sp1<0 || sp2<0 || sp3<0) { Serial.println(F("Use: dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>")); break; }
+            if (sp1<0 || sp2<0 || sp3<0) { Serial.println(F("Use: dispense <motor> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>")); break; }
 
             String smotor  = rest.substring(0, sp1); smotor.trim();
             String starget = rest.substring(sp1+1, sp2); starget.trim();
@@ -789,7 +797,7 @@ void loop() {
             String sto     = rest.substring(sp3+1); sto.trim();
 
             int sp4 = sto.indexOf(' ');
-            if (sp4 < 0) { Serial.println(F("Use: dispense <motor> <target_g> <slowOffset_g> <softCutOffset_g> <timeout_s>")); break; }
+            if (sp4 < 0) { Serial.println(F("Use: dispense <motor> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>")); break; }
             String ssoft   = sto.substring(0, sp4); ssoft.trim();
             String stime   = sto.substring(sp4+1); stime.trim();
 
@@ -797,11 +805,14 @@ void loop() {
             if (!parseMotorSelector(smotor, pin, nm, sizeof(nm))) { Serial.println(F("Unknown motor.")); break; }
 
             float grams = starget.toFloat();
-            grams = constrain(grams, 0.0f, 999.0f);
+            if (grams <= 0.0f || grams > 999.0f) {
+              Serial.println(F("[error] target_g must be between 0 and 999 g"));
+              break;
+            }
             uint16_t tx10 = (uint16_t)(grams*10.0f + 0.5f);
 
-            float slowOffset_g = sslow.toFloat();
-            float softCutOffset_g = ssoft.toFloat();
+            float slowOffset_g = sslow.toFloat();       // 0..100 (percent of target)
+            float softCutOffset_g = ssoft.toFloat();    // 0..100 (maps 0->1.5g below target, 100->0g)
             unsigned long timeout_s = (unsigned long)stime.toInt();
 
             startDispense(pin, nm, slowOffset_g, softCutOffset_g, timeout_s, tx10);
@@ -839,7 +850,7 @@ static void rs485RxMode() {
 static void rs485TxMode() {
   digitalWrite(RS485_RE_PIN, HIGH);  // disable receiver during TX
   digitalWrite(RS485_DE_PIN, HIGH);  // enable driver
-  delayMicroseconds(150);            // turnaround guard (more conservative; MAX485-friendly)
+  delayMicroseconds(150);            // turnaround guard (MAX485-friendly)
 }
 
 // Read/Write 16-bit big-endian helpers for register image
@@ -878,16 +889,19 @@ static void buildResult(uint16_t rc, uint16_t seq, uint16_t err) {
 }
 
 // Helpers to resolve motorId -> pin/name
+// Milk:  11..18 (Milk1..Milk8)
+// Sauce: 21..35 (Sauce1..Sauce15)
 static bool motorIdToPinName(uint16_t motorId, int &pin, const char* &nm) {
-  if (motorId >= 1 && motorId <= 8) {
-    pin = MILK_PINS[motorId-1];
-    nm  = MILK_NAMES[motorId-1];
+  if (motorId >= 11 && motorId <= 18) {
+    uint8_t idx = (uint8_t)(motorId - 11); // 0..7
+    pin = MILK_PINS[idx];
+    nm  = MILK_NAMES[idx];
     return true;
   }
-  if (motorId >= 101 && motorId <= 115) {
-    uint8_t idx = motorId - 100; // 1..15
-    pin = SAUCE_PINS[idx-1];
-    nm  = SAUCE_NAMES[idx-1];
+  if (motorId >= 21 && motorId <= 35) {
+    uint8_t idx = (uint8_t)(motorId - 21); // 0..14
+    pin = SAUCE_PINS[idx];
+    nm  = SAUCE_NAMES[idx];
     return true;
   }
   return false;
@@ -896,9 +910,9 @@ static bool motorIdToPinName(uint16_t motorId, int &pin, const char* &nm) {
 // Executor (DISPENSE/RINSE/TRIGGER are non-blocking; ABORT/CLEAR/STATUS immediate)
 static void executeOpcode(uint16_t opcode, uint16_t seq) {
   bool hasFault =
-      (systemStatus == SYS_MOTOR_FAULT) ||
-      (systemStatus == SYS_LEAK_FAULT)  ||
-      (systemStatus == SYS_SCALE_FAULT) ||
+      (systemStatus == SYS_MOTOR_FAULT)   ||
+      (systemStatus == SYS_LEAK_FAULT)    ||
+      (systemStatus == SYS_SCALE_FAULT)   ||
       (systemStatus == SYS_TIMEOUT_FAULT) ||
       (systemStatus == SYS_ABORTED_FAULT);
 
@@ -972,16 +986,22 @@ static void executeOpcode(uint16_t opcode, uint16_t seq) {
       uint16_t softOff_x10  = regRead(0x0005);
       uint16_t timeout_s    = regRead(0x0006);
 
+      // cap 0 < target_g <= 999 g (0.1g units)
+      if (tgt_x10 == 0 || tgt_x10 > 9990) {
+        buildResult(RC_FAIL, seq, AE_BAD_ARGS);
+        break;
+      }
+
       int pin; const char* nm;
       if (!motorIdToPinName(motorId, pin, nm)) {
         buildResult(RC_FAIL, seq, AE_BAD_ARGS);
         break;
       }
 
-      float slow_g = slowOff_x10 / 10.0f;
-      float soft_g = softOff_x10 / 10.0f;
+      float slowParam = slowOff_x10 / 10.0f;  // 0..100
+      float softParam = softOff_x10 / 10.0f;  // 0..100
 
-      startDispense(pin, nm, slow_g, soft_g, timeout_s, tgt_x10);
+      startDispense(pin, nm, slowParam, softParam, timeout_s, tgt_x10);
 
       if (state != ST_DISPENSING && systemStatus == SYS_SCALE_FAULT) {
         buildResult(RC_FAIL, seq, AE_SCALE);
@@ -1058,7 +1078,7 @@ static void handleModbus() {
                 } else {
                   uint16_t expectedLen = (uint16_t)(13 + writeBytes);
                   if (rxLen == expectedLen) {
-                    // Write data begin at byte 11 (as per original handler logic)
+                    // Write data begin at byte 11
                     const uint8_t* writeData = rxBuf + 11;
                     for (uint16_t i = 0; i < writeQty; i++) {
                       uint16_t val = (uint16_t)((writeData[2 * i] << 8) | writeData[2 * i + 1]);
@@ -1114,7 +1134,7 @@ static void handleModbus() {
                       rs485RxMode();
                     }
                   }
-                  // else: length mismatch after gap → drop silently (frame error)
+                  // else: length mismatch after gap → drop silently
                 }
               }
               // else: too short for 0x17 → drop silently
