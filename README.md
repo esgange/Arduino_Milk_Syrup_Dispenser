@@ -1,8 +1,8 @@
 # Weigh-Scale Feedback Liquid Dispenser (+ Steam Wand Cleaner)
 
-**Motor Controller (Mega 2560) v1.1 — 2025-10-12**  
+**Motor Controller (Mega 2560) v1.2 — 2025-10-22**  
 **Steam Wand Cleaner Slave (Nano Every) v2.4 — 2025-10-21**  
-**Scale Slave (Nano Every + HX711) v1.0 — 2025-10-10**  
+**Scale Slave (Nano Every + HX711) v1.1 — 2025-10-22**  
 **Reference Modbus RTU Master (Nano Every) v1.0**
 
 Authors: **Erdie Gange · ChatGPT 5** · Region: **Asia/Riyadh**
@@ -50,7 +50,8 @@ Authors: **Erdie Gange · ChatGPT 5** · Region: **Asia/Riyadh**
 ### Mega 2560 — Dispenser Controller (ID=1)
 - **RS-485**: `RE+DE → 17`, **Serial1 @ 19200 8N1**.  
 - **Motors**: Milk pins **2..9** (8 ch); Sauce pins **10,11,12,25..47 odd** (15 ch).  
-- **Speed select**: `PIN_SPEEDSEL=23` (**HIGH = 24 V High**, LOW = 12 V Low). Boot default: High.  
+- **Speed select**: `PIN_SPEEDSEL=23` (**HIGH = 24 V High**, LOW = trim-pot-set low rail). Boot default: High.  
+  - On-board trim pot sets the Low rail; **do not trim above ~12 V** or the Mega supply may be overstressed.  
 - **Rinse**: pin **49**.  
 - **Motor fault in**: pin **51** (active-LOW, 1 s debounce).  
 - **Leak sensors** (LMV331): `(A5/A6)` and `(A8/A9)`; `A6/A9` = sensor Vcc, `A5/A8` = logic input.  
@@ -115,6 +116,7 @@ Authors: **Erdie Gange · ChatGPT 5** · Region: **Asia/Riyadh**
 ## Operation
 ### Dispenser behavior
 - **Dispense profile**: starts at **24 V (High)**, auto-drops to **12 V (Low)** when weight reaches `slowPct%` of target. Optional soft-cut stops the motor early, lets the stream coast, then checks target. Hard-cut if target is reached first.  
+- **Low-rail trim**: Low speed rail is set by the on-board trim pot; keep it at or below ~12 V (protects Mega Vin).  
 - **Parameters (DISPENSE)**:  
   - `target_g` (0 < g ≤ 999).  
   - `slowPct` (`0..100`): % of target when to switch to Low.  
@@ -147,9 +149,9 @@ Authors: **Erdie Gange · ChatGPT 5** · Region: **Asia/Riyadh**
 ## Scale firmware (UI & I²C)
 - **Modes**: `IDLE` (blank), `READING`, `CAL`, overflow `HI`. Auto-IDLE after 60 s without ≥1 g movement.  
 - **Tare/Cal**:  
-  - Auto-tare at startup (`SEt`).  
-  - Short press = tare (`SEt`).  
-  - Long press (≥3 s) = enter **CAL** with a silent tare; short press stores new scale factor to EEPROM.  
+  - Auto-tare at startup (`SEt`), 20-sample average.  
+  - Short press = tare (`SEt`), 20-sample average.  
+  - Long press (≥3 s) = enter **CAL** with a silent 20-sample tare; short press stores new scale factor to EEPROM.  
 - **I²C**:  
   - **Write**: `'R' + uint16 target_x10` (LE) → tare + arm target + clear Red LED.  
   - **Read**: `[hit_once, weight_x10_lo, weight_x10_hi]`; `hit_once` clears after one read.  

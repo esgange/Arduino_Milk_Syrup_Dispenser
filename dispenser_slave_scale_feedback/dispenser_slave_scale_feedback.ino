@@ -3,8 +3,8 @@
   │ Scale Slave Firmware — Arduino Nano Every + HX711 + 3-digit 7-seg + I2C  │
   └──────────────────────────────────────────────────────────────────────────┘
 
-  Version : 1.0
-  Date    : 2025-10-10  (Asia/Riyadh)
+  Version : 1.1
+  Date    : 2025-10-22  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
   What this firmware does
@@ -403,7 +403,7 @@ void doShortPressTare() {
   display_showSET();
 
   detachInterrupt(digitalPinToInterrupt(PIN_DOUT));
-  long t = hx_read_average_withScan(16);
+  long t = hx_read_average_withScan(20);
   g_tareOffset = t;
   g_hxReadyFlag = false;
   attachInterrupt(digitalPinToInterrupt(PIN_DOUT), hx_dataReadyISR, FALLING);
@@ -422,7 +422,7 @@ void doStartupTare() {
   g_displayEnabled = true;
   display_showSET();
 
-  long t = hx_read_average_withScan(16);
+  long t = hx_read_average_withScan(20);
   g_tareOffset = t;
   Serial.println(F("Tare done (startup)."));
 
@@ -477,7 +477,7 @@ void pollButton() {
         enterCal();  // show CAL immediately
 
         detachInterrupt(digitalPinToInterrupt(PIN_DOUT));
-        long t = hx_read_average_withScan(16); // one-time silent tare at CAL entry
+        long t = hx_read_average_withScan(20); // one-time silent tare at CAL entry
         g_tareOffset = t;
         setRedLED(false);
         attachInterrupt(digitalPinToInterrupt(PIN_DOUT), hx_dataReadyISR, FALLING);
@@ -583,7 +583,7 @@ void loop() {
     display_showSET();
 
     detachInterrupt(digitalPinToInterrupt(PIN_DOUT));
-    long t = hx_read_average_withScan(16);
+    long t = hx_read_average_withScan(20);
     g_tareOffset = t;
     g_hxReadyFlag = false;
     attachInterrupt(digitalPinToInterrupt(PIN_DOUT), hx_dataReadyISR, FALLING);

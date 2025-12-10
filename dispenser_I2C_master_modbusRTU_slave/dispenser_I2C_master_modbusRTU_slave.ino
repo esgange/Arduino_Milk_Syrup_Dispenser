@@ -4,8 +4,8 @@
   │ Target MCU: Arduino Mega 2560                                                │
   └──────────────────────────────────────────────────────────────────────────────┘
 
-  Version : 1.1 (non-blocking timed ops)
-  Date    : 2025-10-12  (Asia/Riyadh)
+  Version : 1.2 (non-blocking timed ops; adjustable Low via trim)
+  Date    : 2025-10-22  (Asia/Riyadh)
   Authors : Erdie Gange · ChatGPT 5
 
   What this firmware does
@@ -29,10 +29,10 @@ const unsigned long LEAK_SAMPLE_MS    = 1000;
 
 // ===================== Modbus RTU Slave =====================
 #define MODBUS_SLAVE_ID  1
-#define RS485_DE_PIN     A2
-#define RS485_RE_PIN     A3
+#define RS485_DE_PIN     17
+#define RS485_RE_PIN     17
 #define MODBUS_BAUD      19200
-#define MODBUS_SERIAL    Serial3
+#define MODBUS_SERIAL    Serial1
 
 // Minimal register space to cover 0x0000..0x010F
 #define REG_SPACE_SIZE   0x0120
@@ -84,7 +84,7 @@ const __FlashStringHelper* activeScaleName() { return (activeScale == SCALE_MILK
 // ===================== Hardware map =====================
 const uint8_t PIN_MOTOR_FAULT  = 51;    // ACTIVE-LOW
 const uint8_t PIN_RINSER       = 49;    // rinse solenoid
-const uint8_t PIN_SPEEDSEL     = 23;    // LOW=24V (High), HIGH=12V (Low)
+const uint8_t PIN_SPEEDSEL     = 23;    // LOW=24V (High), HIGH=trimmed Low rail (~12V max; do not trim above Mega Vin tolerance)
 
 // Milk motors 2..9
 const uint8_t MILK_PINS[8]  = {2,3,4,5,6,7,8,9};
@@ -138,6 +138,9 @@ unsigned long softStopMs   = 0;
 
 bool lowSpeedApplied   = false;
 bool softCutTriggered  = false;
+
+bool timeoutRetryActive = false;
+unsigned long timeoutRetryEndMs = 0;
 
 float    motorStartDelay_s = 2.0f;
 bool     motorStartPending = false;
@@ -201,8 +204,8 @@ bool isMotorOrSystemOutputPin(uint8_t pin) {
 bool isMilkPin(uint8_t pin)  { for (uint8_t i=0;i<8;i++)  if (pin == MILK_PINS[i])  return true; return false; }
 bool isSaucePin(uint8_t pin) { for (uint8_t i=0;i<15;i++) if (pin == SAUCE_PINS[i]) return true; return false; }
 
-inline void setSpeedHigh() { digitalWrite(PIN_SPEEDSEL, LOW); }   // 24V
-inline void setSpeedLow()  { digitalWrite(PIN_SPEEDSEL, HIGH); }  // 12V
+inline void setSpeedHigh() { digitalWrite(PIN_SPEEDSEL, HIGH); }   // 24V
+inline void setSpeedLow()  { digitalWrite(PIN_SPEEDSEL, LOW); }    // 12V
 
 void allMotorsOff() { for (uint8_t i=0;i<8;i++) digitalWrite(MILK_PINS[i], LOW); for (uint8_t i=0;i<15;i++) digitalWrite(SAUCE_PINS[i], LOW); }
 void allOutputsSafe() { allMotorsOff(); digitalWrite(PIN_RINSER, LOW); setSpeedHigh(); }
@@ -420,6 +423,8 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
   motorFaultStartMs = 0;
 
   softCutTriggered = false;
+  timeoutRetryActive = false;
+  timeoutRetryEndMs = 0;
   lastPollMs = millis() - POLL_INTERVAL_MS;
   startMs = millis();
   softStopMs = 0;
@@ -448,17 +453,31 @@ void startDispense(int pin, const char* name, float slowOffset_g, float softCutO
 void handleDispensing() {
   const unsigned long now = millis();
 
-  if (now - startMs > timeout_ms) {
-    stopActiveMotor();
-    allOutputsSafe();
-    faultFlag = true;
-    systemStatus = SYS_TIMEOUT_FAULT;
-    if (!timeoutFaultLogged) {
-      logEvent(F("TIMEOUT_FAULT"));
-      timeoutFaultLogged = true;
+  // Primary timeout + 3 s low-speed retry window
+  if (!timeoutRetryActive) {
+    if (now - startMs > timeout_ms) {
+      // First timeout hit: force low speed and give extra 3 s to reach target
+      timeoutRetryActive = true;
+      timeoutRetryEndMs = now + 3000UL;   // 3 s retry window
+      setSpeedLow();
+      startActiveMotor();                 // ensure motor is actually running
+      logEvent(F("TIMEOUT_RETRY"));
     }
-    state = ST_IDLE;
-    return;
+  } else {
+    if ((long)(now - timeoutRetryEndMs) >= 0) {
+      // Retry window expired → hard timeout fault
+      stopActiveMotor();
+      allOutputsSafe();
+      faultFlag = true;
+      systemStatus = SYS_TIMEOUT_FAULT;
+      if (!timeoutFaultLogged) {
+        logEvent(F("TIMEOUT_FAULT"));
+        timeoutFaultLogged = true;
+      }
+      state = ST_IDLE;
+      timeoutRetryActive = false;
+      return;
+    }
   }
 
   pollScaleIfDue();
@@ -520,7 +539,7 @@ void handleDispensing() {
       stopActiveMotor();
       softCutTriggered = true;
       softStopMs = now;
-      logEvent(F("SOFTCUT_STOP"));
+      logEvent(F("softCut_STOP"));
       return;
     }
 
@@ -621,6 +640,9 @@ void abortNow() {
   motorStartPending = false;
   motorStartDueMs = 0;
 
+  timeoutRetryActive = false;
+  timeoutRetryEndMs = 0;
+
   systemStatus = SYS_ABORTED_FAULT;
   faultFlag = true;
 
@@ -651,6 +673,9 @@ void clearSystem() {
 
   lowSpeedApplied = false;
   softCutTriggered = false;
+
+  timeoutRetryActive = false;
+  timeoutRetryEndMs = 0;
 
   motorStartPending = false;
   motorStartDueMs = 0;
