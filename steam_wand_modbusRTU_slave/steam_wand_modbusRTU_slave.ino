@@ -1,39 +1,13 @@
-/*
-  ┌───────────────────────────────────────────────────────────────────────────┐
-  │ Steam Wand Module — Modbus RTU Slave (aligned to Motor Controller style) │
-  │ Target MCU: Arduino Nano Every (megaAVR 4809)                            │
-  └───────────────────────────────────────────────────────────────────────────┘
 
-  Version : 2.4 (no-malloc TX + capped readQty)
-  Date    : 2025-10-21  (Asia/Riyadh)
-  Authors : Erdie Gange · ChatGPT 5
-
-  What this firmware does
-  ───────────────────────
-  • Steam-wand controller with a single-shot Modbus RTU slave API (Function 0x17).
-  • API: STATUS(1), CLEAR(2), ABORT(3), OFF(4), INIT(10), FROTH(11), CLEAN(12).
-  • Non-blocking INIT/FROTH/CLEAN so ABORT can preempt at any time (latched ABORT).
-  • Boots in manual control (L298 inputs Hi-Z); auto-enables drivers on first use.
-  • STANDBY/IDLE posture actively drives M1 forward + M2 reverse.
-  • Faults produced: TIMEOUT and ABORTED.
-  • OFF is a distinct SystemStatus (7). ABORT keeps ABORTED_FAULT status but sets
-    motors to IDLE (STANDBY) posture, not OFF/Hi-Z.
-
-  Notes for Modbus master integrators
-  ────────────────────────────────────
-  • This node is Slave ID=2, 19,200 8N1. Half-duplex RS-485.
-  • Only Function 0x17 (Read/Write Multiple Registers) is supported.
-  • Result block is at 0x0100..0x010A (11 regs). Read cap enforced (64 regs).
-*/
 
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
 
-/* ========================= Compile-time flags ========================= */
+
 #define HAVE_L298_PULLDOWNS  1
 
-/* ========================= Modbus / RS-485 =========================== */
+
 #define MODBUS_SLAVE_ID  2
 #define MODBUS_BAUD      19200
 #define MODBUS_CONFIG    SERIAL_8N1
@@ -42,14 +16,14 @@ const uint8_t RS485_RE_PIN = A1;
 const uint8_t RS485_DE_PIN = A2;
 #define MODBUS_PORT Serial1
 
-// 11-bit char timing; T3.5 ≈ 2.0 ms @ 19,200
+
 const uint32_t MB_CHAR_US = (11UL * 1000000UL) / MODBUS_BAUD;
 const uint32_t MB_T3P5_US = (uint32_t)(MB_CHAR_US * 3.5);
 
-// Cap read size to bound response and avoid dynamic allocation
+
 #define MB_MAX_READ_QTY 64
 
-/* ========================= Hardware map ============================== */
+
 const uint8_t SOLENOID_PIN = 2;
 const uint8_t M1_IN1 = 3;
 const uint8_t M1_IN2 = 4;
@@ -58,15 +32,15 @@ const uint8_t M2_IN2 = 6;
 const uint8_t ENA_PIN = 7;
 const uint8_t ENB_PIN = 8;
 
-/* MAX6675 (bit-banged) */
+
 const uint8_t TC_SO  = 12;
 const uint8_t TC_CS  = 10;
 const uint8_t TC_SCK = 13;
 
-/* ========================= Timings & limits ========================== */
+
 const unsigned long MAX_TIMEOUT_MS   = 10UL * 60UL * 1000UL;
 
-/* ========================= App state ================================= */
+
 enum Mode : uint8_t { MODE_OFF, MODE_STANDBY, MODE_INIT, MODE_FROTH, MODE_CLEAN };
 Mode currentMode = MODE_OFF;
 
@@ -74,28 +48,28 @@ volatile bool apiBusy      = false;
 volatile bool opBusy       = false;
 volatile bool abortRequested = false;
 
-/* Non-blocking operation engine */
+
 enum ActiveOp : uint8_t { OP_NONE, OP_INIT_NB, OP_FROTH_NB, OP_CLEAN_NB };
 volatile ActiveOp activeOp = OP_NONE;
 
 static unsigned long opStartMs = 0;
-static unsigned long opPhaseEndMs = 0; // per-phase for CLEAN
-static uint8_t cleanPhase = 0;         // 0=valve,1=steam,2=standby
+static unsigned long opPhaseEndMs = 0; 
+static uint8_t cleanPhase = 0;         
 
-/* FROTH params */
+
 static uint16_t targetC_x10 = 0;
 static uint16_t timeout_s_x10 = 0;
 
-/* INIT/CLEAN params */
+
 static uint16_t initSeconds_x10 = 0;
 static uint16_t clean_tValve_x10 = 0, clean_tSteam_x10 = 0, clean_tStandby_x10 = 0;
 
-/* Temperature cache */
+
 static unsigned long lastTcReadMs = 0;
 static float  tempC   = NAN;
 static bool   tempOk  = false;
 
-/* ========================= Result / API =============================== */
+
 #define REG_SPACE_SIZE   0x0120
 static uint16_t regSpace[REG_SPACE_SIZE];
 
@@ -112,16 +86,16 @@ enum Opcode : uint16_t {
 enum SystemStatus : uint16_t {
   SYS_IDLE=0,
   SYS_ACTIVE=1,
-  SYS_MOTOR_FAULT=2,   // never used here
-  SYS_LEAK_FAULT=3,    // never used here
-  SYS_SCALE_FAULT=4,   // never used here
+  SYS_MOTOR_FAULT=2,   
+  SYS_LEAK_FAULT=3,    
+  SYS_SCALE_FAULT=4,   
   SYS_TIMEOUT_FAULT=5,
   SYS_ABORTED_FAULT=6,
-  SYS_OFF=7            // OFF distinct from IDLE
+  SYS_OFF=7            
 };
 volatile SystemStatus systemStatus = SYS_IDLE;
 
-/* ========================= Logging helpers =========================== */
+
 static const __FlashStringHelper* systemStatusStr(){
   switch (systemStatus){
     case SYS_IDLE:           return F("IDLE");
@@ -156,7 +130,7 @@ static inline void printCommonEndWithTime(){
   Serial.println(F(" s"));
 }
 
-/* Begin-event logs */
+
 void logBegin_INIT(uint16_t secs_x10){
   Serial.print(F("[event] INIT_BEGIN"));
   Serial.print(F(" secs=")); Serial.print(secs_x10/10.0f, 1);
@@ -187,7 +161,7 @@ void logBegin_CLEAN_P2(uint16_t tStandby_x10){
   printCommonNoTime();
 }
 
-/* End-event logs */
+
 void logEnd(const __FlashStringHelper* label){
   Serial.print(F("[event] ")); Serial.print(label);
   printCommonEndWithTime();
@@ -198,9 +172,9 @@ void logEnd_FrothTargetReached(float tempC_now){
   printCommonEndWithTime();
 }
 
-/* ========================= RS-485 / CRC =============================== */
+
 inline void rs485RxMode(){ digitalWrite(RS485_DE_PIN, LOW); digitalWrite(RS485_RE_PIN, LOW); }
-inline void rs485TxMode(){ digitalWrite(RS485_RE_PIN, HIGH); digitalWrite(RS485_DE_PIN, HIGH); delayMicroseconds(150); } // generous turnaround guard
+inline void rs485TxMode(){ digitalWrite(RS485_RE_PIN, HIGH); digitalWrite(RS485_DE_PIN, HIGH); delayMicroseconds(150); } 
 
 uint16_t mb_crc16(const uint8_t* buf, uint16_t len){
   uint16_t crc=0xFFFF;
@@ -219,24 +193,24 @@ void mb_send_ok(const uint8_t addr, const uint8_t* pdu, uint16_t pdulen){
   frame[0]=addr;
   memcpy(frame+1, pdu, pdulen);
   uint16_t crc = mb_crc16(frame, pdulen+1);
-  frame[pdulen+1] = crc & 0xFF;           // CRC lo
-  frame[pdulen+2] = (crc>>8) & 0xFF;      // CRC hi
+  frame[pdulen+1] = crc & 0xFF;           
+  frame[pdulen+2] = (crc>>8) & 0xFF;      
   rs485TxMode();
   MODBUS_PORT.write(frame, pdulen+3);
   MODBUS_PORT.flush();
   rs485RxMode();
-  delayMicroseconds(MB_CHAR_US);          // let line settle
+  delayMicroseconds(MB_CHAR_US);          
 }
 void mb_send_exc(const uint8_t addr, uint8_t func, uint8_t code){
   uint8_t resp[3]; resp[0] = (uint8_t)(func | 0x80); resp[1] = code;
   mb_send_ok(addr, resp, 2);
 }
 
-/* ========================= Register helpers =========================== */
+
 static inline uint16_t regRead(uint16_t addr){ return (addr<REG_SPACE_SIZE)? regSpace[addr] : 0; }
 static inline void     regWrite(uint16_t addr, uint16_t val){ if(addr<REG_SPACE_SIZE) regSpace[addr]=val; }
 
-/* ========================= L298 controls ============================== */
+
 static bool motorsEnabled = false;
 
 static inline void enableMotors(){
@@ -284,13 +258,13 @@ static inline void standbyDrive(){
 }
 
 static inline unsigned long sec10_to_ms(uint16_t s_x10){
-  // cap to MAX_TIMEOUT_MS
-  unsigned long ms = (unsigned long)((s_x10 * 100UL)); // 0.1 s units → ms
+  
+  unsigned long ms = (unsigned long)((s_x10 * 100UL)); 
   if (ms > MAX_TIMEOUT_MS) ms = MAX_TIMEOUT_MS;
   return ms;
 }
 
-/* ========================= Thermocouple (MAX6675) ===================== */
+
 uint16_t tc_readRaw(){
   uint16_t v=0;
   digitalWrite(TC_CS, LOW); delayMicroseconds(2);
@@ -315,101 +289,101 @@ bool tc_tryReadC_nonblocking(float &c){
   c = tempC; return tempOk;
 }
 
-/* ========================= Output safety ============================== */
+
 void allOutputsSafe(){
   solenoidOff();
   if (motorsEnabled){ M1_Stop(); M2_Stop(); }
-  disableMotors(); // boot/manual-control (Hi-Z)
+  disableMotors(); 
   currentMode = MODE_OFF;
 }
 
-/* ========================= Clear, Abort & Off ========================= */
+
 void clearSystem(){
   allOutputsSafe();
 
-  // Reset op engine
+  
   opBusy = false; abortRequested = false;
   activeOp = OP_NONE; cleanPhase = 0;
   opStartMs = 0; opPhaseEndMs = 0;
 
-  // Reset params
+  
   targetC_x10 = timeout_s_x10 = 0;
   initSeconds_x10 = 0;
   clean_tValve_x10 = 0; clean_tSteam_x10 = 0; clean_tStandby_x10 = 0;
 
-  // Status
+  
   systemStatus = SYS_IDLE;
 
-  // Result extras
-  regWrite(0x0105, 0); // elapsed
+  
+  regWrite(0x0105, 0); 
 
-  // Log
+  
   Serial.print(F("[event] CLEAR"));
   printCommonNoTime();
 }
 
-// ABORT: keep ABORTED_FAULT status, move to IDLE posture (STANDBY drive)
+
 void abortNow(){
   unsigned long t0 = millis();
 
-  // Signal op engine to stop immediately
+  
   abortRequested = true;
 
-  // Cancel any operation synchronously
+  
   opBusy = false;
   activeOp = OP_NONE;
   cleanPhase = 0;
 
-  // IDLE posture: solenoid off, STANDBY drive (M1_FWD + M2_REV)
+  
   solenoidOff();
   standbyDrive();
   currentMode = MODE_STANDBY;
 
-  // Latch ABORTED fault
+  
   systemStatus = SYS_ABORTED_FAULT;
 
-  // Build timing metric in ELAPSED_S×10
+  
   uint16_t elap_x10 = (uint16_t)(((millis()-t0) + 50) / 100);
   regWrite(0x0105, elap_x10);
 
-  // Log
+  
   Serial.print(F("[event] ABORTED→IDLE_POSTURE"));
   printCommonNoTime();
 }
 
-// OFF: go to true OFF/Hi-Z posture and set SYS_OFF (distinct from IDLE)
+
 void offNow(){
-  // Stop any running op
+  
   opBusy = false;
   activeOp = OP_NONE;
   cleanPhase = 0;
   abortRequested = false;
 
-  // Drive outputs safe (Hi-Z) and set MODE_OFF
+  
   allOutputsSafe();
 
-  // NEW: set OFF as a distinct status always
+  
   systemStatus = SYS_OFF;
 
-  // Log
+  
   Serial.print(F("[event] OFF"));
   printCommonNoTime();
 }
 
-/* ========================= Result builder ============================= */
+
 static uint16_t faultToApiError(uint16_t st){
   switch (st){
     case SYS_TIMEOUT_FAULT: return AE_TIMEOUT;
     case SYS_ABORTED_FAULT: return AE_ABORTED;
-    case SYS_MOTOR_FAULT:   return AE_MOTOR;   // legacy/unused
-    case SYS_LEAK_FAULT:    return AE_LEAK;    // legacy/unused
-    case SYS_SCALE_FAULT:   return AE_SCALE;   // legacy/unused
+    case SYS_MOTOR_FAULT:   return AE_MOTOR;   
+    case SYS_LEAK_FAULT:    return AE_LEAK;    
+    case SYS_SCALE_FAULT:   return AE_SCALE;   
     default: return AE_NONE;
   }
 }
 
 static void buildResult(uint16_t rc, uint16_t seq, uint16_t err){
-  // AUX0: temperature C×10 (0 if invalid)
+  
   uint16_t tempx10 = 0;
   if (tempOk && isfinite(tempC)){
     long v = lroundf(tempC * 10.0f);
@@ -422,11 +396,11 @@ static void buildResult(uint16_t rc, uint16_t seq, uint16_t err){
   regWrite(0x0102, (uint16_t)systemStatus);
   regWrite(0x0103, seq);
   regWrite(0x0104, tempx10);
-  // 0x0105 (elapsed) is updated by ops/abort; leave as-is unless set by caller
+  
   regWrite(0x0106, 0); regWrite(0x0107, 0); regWrite(0x0108, 0); regWrite(0x0109, 0); regWrite(0x010A, 0);
 }
 
-/* ========================= Non-blocking operation engine ============= */
+
 static void startInitSeconds(uint16_t seconds_x10){
   if (seconds_x10 == 0){ return; }
   initSeconds_x10 = seconds_x10;
@@ -470,17 +444,17 @@ static void startClean(uint16_t tValve_x10, uint16_t tSteam_x10, uint16_t tStand
   opBusy = true; abortRequested = false;
   opStartMs = millis();
 
-  // Phase 0: Valve (M1_Fwd)
+  
   M1_Fwd(); solenoidOff();
   cleanPhase = 0;
   opPhaseEndMs = opStartMs + sec10_to_ms(clean_tValve_x10);
   logBegin_CLEAN(clean_tValve_x10, clean_tSteam_x10, clean_tStandby_x10);
 }
 
-/* Phase helpers (complete op with status) */
+
 static void finishOpSuccess(const __FlashStringHelper* tag){
   solenoidOff();
-  standbyDrive();                  // STANDBY = M1_FWD + M2_REV
+  standbyDrive();                  
   currentMode = MODE_STANDBY;
 
   systemStatus = SYS_IDLE;
@@ -492,11 +466,11 @@ static void finishOpSuccess(const __FlashStringHelper* tag){
   logEnd(tag);
 }
 
-// Adjusted: only force OFF/Hi-Z for non-ABORT faults
+
 static void finishOpFault(SystemStatus st, const __FlashStringHelper* tag){
   if (st != SYS_ABORTED_FAULT) {
-    allOutputsSafe();              // TIMEOUT and others → OFF/Hi-Z posture
-  } // else keep ABORT posture set in abortNow() (STANDBY/idle)
+    allOutputsSafe();              
+  } 
 
   systemStatus = st;
   opBusy = false; activeOp = OP_NONE; cleanPhase = 0;
@@ -508,12 +482,12 @@ static void finishOpFault(SystemStatus st, const __FlashStringHelper* tag){
 }
 
 static void pumpCore(){
-  // keep temp cache fresh
+  
   float c; (void)tc_tryReadC_nonblocking(c);
 
   if (activeOp == OP_NONE) return;
 
-  // ABORT preemption
+  
   if (abortRequested){
     finishOpFault(SYS_ABORTED_FAULT, F("ABORTED_DURING_OP"));
     return;
@@ -533,7 +507,7 @@ static void pumpCore(){
         long curCx10 = lroundf(tempC * 10.0f);
         if ((long)curCx10 >= (long)targetC_x10){
           solenoidOff();
-          standbyDrive();          // STANDBY after success
+          standbyDrive();          
           currentMode = MODE_STANDBY;
           systemStatus = SYS_IDLE;
           opBusy = false; activeOp = OP_NONE; cleanPhase = 0;
@@ -552,7 +526,7 @@ static void pumpCore(){
     case OP_CLEAN_NB: {
       if (cleanPhase == 0){
         if ((long)(now - opPhaseEndMs) >= 0){
-          // Phase 1: Steam
+          
           solenoidOn();
           cleanPhase = 1;
           opPhaseEndMs = now + sec10_to_ms(clean_tSteam_x10);
@@ -560,13 +534,13 @@ static void pumpCore(){
         }
       } else if (cleanPhase == 1){
         if ((long)(now - opPhaseEndMs) >= 0){
-          // Phase 2: Standby
+          
           solenoidOff(); M2_Rev();
           cleanPhase = 2;
           opPhaseEndMs = now + sec10_to_ms(clean_tStandby_x10);
           logBegin_CLEAN_P2(clean_tStandby_x10);
         }
-      } else { // phase 2
+      } else { 
         if ((long)(now - opPhaseEndMs) >= 0){
           finishOpSuccess(F("CLEAN_DONE"));
         }
@@ -577,9 +551,9 @@ static void pumpCore(){
   }
 }
 
-/* ========================= Executor (0x17 API) ======================= */
+
 static void executeOpcode(uint16_t opcode, uint16_t seq){
-  // Only TIMEOUT/ABORTED are considered fault latches that block new ops
+  
   bool hasFault =
     (systemStatus == SYS_TIMEOUT_FAULT) ||
     (systemStatus == SYS_ABORTED_FAULT);
@@ -611,7 +585,7 @@ static void executeOpcode(uint16_t opcode, uint16_t seq){
 
     case OP_OFF: {
       offNow();
-      buildResult(RC_OK, seq, AE_NONE);   // systemStatus now SYS_OFF
+      buildResult(RC_OK, seq, AE_NONE);   
     } break;
 
     case OP_INIT: {
@@ -622,7 +596,7 @@ static void executeOpcode(uint16_t opcode, uint16_t seq){
       }
       startInitSeconds(seconds_x10);
       if (opBusy || systemStatus == SYS_ACTIVE){
-        buildResult(RC_OK, seq, AE_NONE); // accepted; completes asynchronously
+        buildResult(RC_OK, seq, AE_NONE); 
       } else {
         uint16_t err = faultToApiError(systemStatus);
         buildResult(RC_FAIL, seq, err ? err : AE_INVALID_CMD);
@@ -668,14 +642,14 @@ static void executeOpcode(uint16_t opcode, uint16_t seq){
   }
 }
 
-/* ========================= Modbus 0x17 frame proc ===================== */
+
 static void process0x17(uint8_t* frame, uint16_t len){
   uint8_t addr = frame[0];
   uint8_t func = frame[1];
   if (addr != MODBUS_SLAVE_ID){ return; }
   if (func != 0x17){ mb_send_exc(addr, func, 0x01); return; }
 
-  if (len < 13){ return; } // minimum header + CRC already checked by caller
+  if (len < 13){ return; } 
 
   uint16_t readStart  = (uint16_t)((frame[2]<<8) | frame[3]);
   uint16_t readQty    = (uint16_t)((frame[4]<<8) | frame[5]);
@@ -683,18 +657,18 @@ static void process0x17(uint8_t* frame, uint16_t len){
   uint16_t writeQty   = (uint16_t)((frame[8]<<8) | frame[9]);
   uint8_t  writeBytes = frame[10];
 
-  // Sanity checks on write section
+  
   if (writeBytes != (uint8_t)(writeQty*2)){ mb_send_exc(addr, func, 0x03); return; }
   if (len < (uint16_t)(11 + writeBytes + 2)){ return; }
 
-  // Apply writes
+  
   const uint8_t* writeData = frame + 11;
   for (uint16_t i=0;i<writeQty;i++){
     uint16_t val = (uint16_t)((writeData[2*i]<<8) | writeData[2*i+1]);
     if ((uint32_t)(writeStart+i) < REG_SPACE_SIZE) regWrite(writeStart + i, val);
   }
 
-  // Execute command
+  
   uint16_t opcode = regRead(0x0000);
   uint16_t seq    = regRead(0x0001);
 
@@ -702,11 +676,11 @@ static void process0x17(uint8_t* frame, uint16_t len){
   executeOpcode(opcode, seq);
   apiBusy = false;
 
-  // Guard maximum read quantity and build static PDU (no malloc)
+  
   if (readQty > MB_MAX_READ_QTY){ mb_send_exc(addr, func, 0x03); return; }
 
   const uint16_t respBytes = (uint16_t)(readQty*2);
-  uint16_t pdulen = (uint16_t)(2 + respBytes);     // func + byteCount + data
+  uint16_t pdulen = (uint16_t)(2 + respBytes);     
 
   static uint8_t pdu[2 + 2*MB_MAX_READ_QTY];
   pdu[0] = func; pdu[1] = (uint8_t)respBytes;
@@ -718,7 +692,7 @@ static void process0x17(uint8_t* frame, uint16_t len){
   mb_send_ok(addr, pdu, pdulen);
 }
 
-/* ========================= Gap-based poller =========================== */
+
 void handleModbus(){
   static uint8_t  rxBuf[260];
   static uint16_t rxLen = 0; static unsigned long lastByteUs = 0;
@@ -743,7 +717,7 @@ void handleModbus(){
   }
 }
 
-/* ========================= CLI helpers (USB) ========================== */
+
 void printHelp(){
   Serial.println(F("Commands:"));
   Serial.println(F("  help"));
@@ -757,14 +731,14 @@ void printHelp(){
 }
 
 void execCliOpcode(uint16_t opcode){
-  executeOpcode(opcode, /*seq*/0);
+  executeOpcode(opcode, 0);
 }
 
 String readLineNonBlocking_USB(){
   static String buf; while (Serial.available()){ char ch=(char)Serial.read(); if (ch=='\r') continue; if (ch=='\n'){ String out=buf; buf=""; out.trim(); return out; } if (buf.length()<120) buf += ch; } return String();
 }
 
-// Pretty USB printout for STATUS (CLI)
+
 void printStatusBlocking_USB(){
   Serial.print(F("Sys=")); Serial.print(systemStatusStr());
   Serial.print(F(" | Busy=")); Serial.print(opBusy ? F("YES") : F("NO"));
@@ -828,10 +802,10 @@ void handleCli(){
   }
 }
 
-/* ========================= Setup / Loop =============================== */
+
 void setup(){
   pinMode(SOLENOID_PIN, OUTPUT); solenoidOff();
-  disableMotors(); // boot in manual control (Hi-Z)
+  disableMotors(); 
 
   pinMode(TC_CS, OUTPUT); pinMode(TC_SCK, OUTPUT); pinMode(TC_SO, INPUT);
   digitalWrite(TC_CS, HIGH); digitalWrite(TC_SCK, LOW);
@@ -848,7 +822,7 @@ void setup(){
 }
 
 void loop(){
-  handleModbus();   // non-blocking, gap-based
-  pumpCore();       // advance active operation
-  handleCli();      // USB CLI
+  handleModbus();   
+  pumpCore();       
+  handleCli();      
 }

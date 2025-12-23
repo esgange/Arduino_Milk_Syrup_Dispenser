@@ -1,78 +1,34 @@
-/*
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │ Arduino Nano Every — Modbus RTU Master (0x17) for Dispenser(ID=1) + Cleaner(ID=2)
-  │ RS-485: MAX485 — RO->D0(RX1), DI->D1(TX1), RE+DE->D2 (HIGH=TX, LOW=RX)
-  └──────────────────────────────────────────────────────────────────────────────┘
 
-  Bus: 19200 8N1
-
-  Dispenser (ID=1) CLI:
-    d.status
-    d.clear
-    d.abort
-    d.rinse <seconds>
-    d.trigger <motorId|name> <seconds>
-    d.dispense <motorId|name> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>
-
-  Motor tokens:
-    Milk1..Milk8   (or m1..m8)       -> 11..18
-    Sauce1..Sauce15 (or s1..s15)     -> 21..35
-    Numeric IDs are accepted too.
-
-  Cleaner (ID=2) CLI:
-    c.status
-    c.clear
-    c.abort
-    c.off
-    c.init  <seconds>
-    c.froth <targetC> <timeout_s>
-    c.clean <tValve_s> <tSteam_s> <tStandby_s>
-
-  Behavior:
-    • Asynchronous ops on the slaves; master does not block.
-    • On acceptance (OK+ACTIVE), master records a pending op and silently polls STATUS every ~150 ms.
-    • While pending: CLI stays responsive; '...status' prints a snapshot; '...abort' preempts immediately.
-    • Exactly one final outcome line per op: "[cmd] done." or "[cmd] ended: <FAULT/ABORTED/OFF>".
-    • Idle: no datalog spam.
-
-  Robustness:
-    • If a start command reply has CRC/timeout, master probes STATUS.
-      If STATUS shows ACTIVE, it treats the command as accepted (salvage path).
-
-  Comms:
-    • Modbus RTU function 0x17 (Read/Write Multiple Registers) on both nodes.
-    • Same transaction packing/timing style as your stand-alone masters.
-*/
 
 #include <Arduino.h>
 #include <string.h>
 
-/* ---------------- RS485 link ---------------- */
-#define RS485_EN_PIN 2              // RE/DE tied here (HIGH=TX, LOW=RX)
-#define RS485       Serial1         // bus UART
+
+#define RS485_EN_PIN 2              
+#define RS485       Serial1         
 #define BUS_BAUD    19200
 
-/* ---- Timing: 3.5 chars for inter-frame gap (as in your examples) ---- */
-const uint16_t TCHAR_US = (uint16_t)((11.0f / BUS_BAUD) * 1000000.0f + 0.5f); // ~573 µs @19200 (conservative 11 bits)
-const uint16_t T3P5_US  = (uint16_t)(3.5f * TCHAR_US);                        // ~2.0 ms
 
-/* ---------------- Modbus constants ---------------- */
+const uint16_t TCHAR_US = (uint16_t)((11.0f / BUS_BAUD) * 1000000.0f + 0.5f); 
+const uint16_t T3P5_US  = (uint16_t)(3.5f * TCHAR_US);                        
+
+
 #define MB_FUNC_RW_MREGS 0x17
 
-/* Common register map for both slaves */
+
 #define REG_CMD_BASE  0x0000
 #define REG_RES_BASE  0x0100
-const uint16_t RES_QTY = 0x000B; // 0x0100..0x010A
+const uint16_t RES_QTY = 0x000B; 
 
-/* Dispenser IDs & opcodes */
+
 #define DISP_SLAVE_ID     1
 enum DispOpcode : uint16_t { D_OP_STATUS=1, D_OP_CLEAR=2, D_OP_ABORT=3, D_OP_DISPENSE=10, D_OP_RINSE=11, D_OP_TRIGGER=12 };
 
-/* Cleaner IDs & opcodes */
+
 #define CLEAN_SLAVE_ID    2
 enum CleanOpcode : uint16_t { C_OP_STATUS=1, C_OP_CLEAR=2, C_OP_ABORT=3, C_OP_OFF=4, C_OP_INIT=10, C_OP_FROTH=11, C_OP_CLEAN=12 };
 
-/* Result decode */
+
 enum ResultCode : uint16_t { RC_OK=0, RC_FAIL=1 };
 enum ApiError   : uint16_t {
   AE_NONE=0, AE_BUSY=1, AE_MOTOR=2, AE_LEAK=3, AE_SCALE=4, AE_TIMEOUT=5, AE_BAD_ARGS=6, AE_INVALID_CMD=7, AE_ABORTED=8
@@ -81,12 +37,10 @@ enum SystemStatus : uint16_t {
   SYS_IDLE=0, SYS_ACTIVE=1, SYS_MOTOR_FAULT=2, SYS_LEAK_FAULT=3, SYS_SCALE_FAULT=4, SYS_TIMEOUT_FAULT=5, SYS_ABORTED_FAULT=6, SYS_OFF=7
 };
 
-/* Poll cadence for silent loops */
+
 const uint16_t STATUS_POLL_MS = 150;
 
-/* ---------------------------------------------
-   CRC16 (Modbus) poly 0xA001, init 0xFFFF
-   --------------------------------------------- */
+
 uint16_t mb_crc16(const uint8_t* data, uint16_t len) {
   uint16_t crc = 0xFFFF;
   for (uint16_t pos = 0; pos < len; pos++) {
@@ -99,16 +53,20 @@ uint16_t mb_crc16(const uint8_t* data, uint16_t len) {
   return crc;
 }
 
-/* ---------------------------------------------
-   RS485 direction control
-   --------------------------------------------- */
+
 inline void rs485Rx() { digitalWrite(RS485_EN_PIN, LOW); }
 inline void rs485Tx() { digitalWrite(RS485_EN_PIN, HIGH); }
 
-/* ---------------------------------------------
-   Utils
-   --------------------------------------------- */
+
 void purgeRx() { while (RS485.available()) (void)RS485.read(); }
+
+bool waitForByte(uint32_t deadlineMs) {
+  while ((long)(deadlineMs - millis()) >= 0) {
+    if (RS485.available()) return true;
+    delayMicroseconds(100);
+  }
+  return false;
+}
 
 bool readExact(uint8_t* buf, size_t n, uint32_t deadlineMs) {
   size_t got = 0;
@@ -129,9 +87,7 @@ void hexDump(const uint8_t* b, size_t n) {
   Serial.println();
 }
 
-/* ---------------------------------------------
-   Core 0x17 transaction (same packing/timing style you used)
-   --------------------------------------------- */
+
 bool mbReadWriteMultiple(uint8_t slaveId,
                          uint16_t readStart, uint16_t readQty,
                          uint16_t writeStart, const uint16_t* writeRegs, uint16_t writeQty,
@@ -141,7 +97,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
 {
   const uint8_t func = MB_FUNC_RW_MREGS;
   const uint8_t writeByteCount = (uint8_t)(writeQty * 2);
-  const uint16_t pduLen  = 1+1 +2+2 +2+2 +1 + writeByteCount; // no CRC
+  const uint16_t pduLen  = 1+1 +2+2 +2+2 +1 + writeByteCount; 
   const uint16_t frameLen = pduLen + 2;
   uint8_t frame[256];
   if (frameLen > sizeof(frame)) return false;
@@ -170,13 +126,13 @@ bool mbReadWriteMultiple(uint8_t slaveId,
   delayMicroseconds(T3P5_US);
 
   rs485Tx();
-  delayMicroseconds(10);
+  delayMicroseconds(20);
   RS485.write(frame, idx);
   RS485.flush();
   rs485Rx();
-  delayMicroseconds(50);
+  delayMicroseconds(200);
 
-  // Expect: addr, func, byteCount, data(byteCount), crcLo, crcHi
+  
   const uint16_t expectDataBytes = (uint16_t)(readQty * 2);
 
   uint8_t hdr[3];
@@ -186,7 +142,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
     return false;
   }
 
-  // Exception?
+  
   if ((hdr[1] & 0x80) && hdr[0] == slaveId) {
     uint8_t exCrc[2];
     (void)readExact(exCrc, 2, deadline);
@@ -209,7 +165,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
     return false;
   }
 
-  // Read payload + CRC
+  
   const uint16_t rem = expectDataBytes + 2;
   uint8_t rest[300];
   if (!readExact(rest, rem, deadline)) {
@@ -217,7 +173,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
     return false;
   }
 
-  // CRC check (over addr..byteCount+data)
+  
   uint8_t full[3 + 300];
   memcpy(full, hdr, 3);
   memcpy(full+3, rest, expectDataBytes);
@@ -233,7 +189,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
     return false;
   }
 
-  // Unpack data to regs
+  
   if (respRegsLen < readQty) return false;
   for (uint16_t i=0;i<readQty;i++) {
     respRegs[i] = (uint16_t)((rest[2*i] << 8) | rest[2*i+1]);
@@ -241,9 +197,7 @@ bool mbReadWriteMultiple(uint8_t slaveId,
   return true;
 }
 
-/* ---------------------------------------------
-   Pretty-print helpers
-   --------------------------------------------- */
+
 const char* errStr(uint16_t e) {
   switch (e) {
     case AE_NONE:        return "NONE";
@@ -272,14 +226,12 @@ const char* sysStr(uint16_t s) {
   }
 }
 
-/* ---------------------------------------------
-   Motor token <-> numeric ID for Dispenser
-   --------------------------------------------- */
+
 bool motorTokenToId(const String& token, uint16_t& outId) {
   String t = token; t.trim();
   String tl = t; tl.toLowerCase();
 
-  // numeric?
+  
   bool allDigits = true;
   for (uint16_t i=0;i<tl.length();++i) if (!isDigit(tl[i])) { allDigits=false; break; }
   if (allDigits && tl.length()>0) { outId = (uint16_t)tl.toInt(); return true; }
@@ -306,9 +258,7 @@ void idToName(uint16_t motorId, char* out, size_t cap) {
   }
 }
 
-/* =========================================================================================
-   DISPENSER (ID=1)
-   ========================================================================================= */
+
 
 struct PendingOp {
   uint8_t kind = 0;
@@ -327,28 +277,30 @@ struct DeviceDisp {
   bool abortRequested = false;
 } DISP;
 
-/* [sent] echoes */
+
 static void d_logSent_STATUS() { Serial.println(F("-------------\n[sent] STATUS.")); }
 static void d_logSent_CLEAR()  { Serial.println(F("-------------\n[sent] CLEAR.")); }
 static void d_logSent_ABORT()  { Serial.println(F("-------------\n[sent] ABORT.")); }
 static void d_logSent_RINSE(float seconds) {
   Serial.print(F("-------------\n[sent] RINSE seconds=")); Serial.print(seconds,1); Serial.println(F("."));
 }
-static void d_logSent_TRIGGER(uint16_t motorId, float seconds) {
+static void d_logSent_TRIGGER(uint16_t motorId, float seconds, bool highSpeed) {
   char name[16]; idToName(motorId, name, sizeof(name));
   Serial.print(F("-------------\n[sent] TRIGGER motor=")); Serial.print(name);
-  Serial.print(F(" seconds=")); Serial.print(seconds,1); Serial.println(F("."));
+  Serial.print(F(" seconds=")); Serial.print(seconds,1);
+  Serial.print(F(" speed=")); Serial.print(highSpeed ? F("HIGH") : F("LOW"));
+  Serial.println(F("."));
 }
 static void d_logSent_DISPENSE(uint16_t motorId, float target_g, float slow_g, float soft_g, uint16_t timeout_s) {
   char name[16]; idToName(motorId, name, sizeof(name));
   Serial.print(F("-------------\n[sent] DISPENSE motor=")); Serial.print(name);
   Serial.print(F(" target_g=")); Serial.print(target_g,1);
   Serial.print(F(" slowPct=")); Serial.print(slow_g,1);
-  Serial.print(F(" softCut=")); Serial.print(soft_g,1);
+  Serial.print(F(" viscousPct=")); Serial.print(soft_g,1);
   Serial.print(F(" timeout_s=")); Serial.print(timeout_s); Serial.println(F("."));
 }
 
-/* Brief result line (same style across) */
+
 void d_printResultBrief(const uint16_t* R) {
   Serial.print(F("result=")); Serial.print(R[0]==RC_OK ? F("OK") : F("FAIL"));
   Serial.print(F("  error=")); Serial.print(errStr(R[1]));
@@ -356,7 +308,7 @@ void d_printResultBrief(const uint16_t* R) {
   Serial.println();
 }
 
-/* API wrappers (seq=0) */
+
 bool d_api_status(uint16_t* outRegs, uint32_t timeoutMs=600) {
   uint16_t W[2] = { D_OP_STATUS, 0 };
   return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
@@ -381,11 +333,12 @@ bool d_api_rinse(float seconds, uint16_t* outRegs) {
   d_logSent_RINSE(seconds);
   return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 3, outRegs, RES_QTY, 2000);
 }
-bool d_api_trigger(uint16_t motorId, float seconds, uint16_t* outRegs) {
+bool d_api_trigger(uint16_t motorId, float seconds, bool highSpeed, uint16_t* outRegs) {
   uint16_t seconds_x10 = (uint16_t)(seconds*10.0f + 0.5f);
-  uint16_t W[4] = { D_OP_TRIGGER, 0, motorId, seconds_x10 };
-  d_logSent_TRIGGER(motorId, seconds);
-  return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 4, outRegs, RES_QTY, 2000);
+  uint16_t flags = highSpeed ? 0x0001 : 0x0000;
+  uint16_t W[5] = { D_OP_TRIGGER, 0, motorId, seconds_x10, flags };
+  d_logSent_TRIGGER(motorId, seconds, highSpeed);
+  return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 5, outRegs, RES_QTY, 2000);
 }
 bool d_api_dispense(uint16_t motorId, float target_g, float slow_g, float soft_g, uint16_t timeout_s, uint16_t* outRegs) {
   auto to_x10 = [](float f)->uint16_t { long v = (long)(f*10.0f + 0.5f); if (v<0) v=0; if (v>65535) v=65535; return (uint16_t)v; };
@@ -394,7 +347,7 @@ bool d_api_dispense(uint16_t motorId, float target_g, float slow_g, float soft_g
   return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 7, outRegs, RES_QTY, 2000);
 }
 
-/* Salvage acceptance (if start reply failed) */
+
 static bool d_salvage_accept(uint16_t* outRegs, uint8_t kindLabel){
   uint16_t S[RES_QTY]={0};
   bool ok = d_api_status(S,600);
@@ -408,17 +361,17 @@ static bool d_salvage_accept(uint16_t* outRegs, uint8_t kindLabel){
   return false;
 }
 
-/* Pending scheduler */
+
 const char* d_pendingLabel(uint8_t k){ return (k==D_PK_RINSE)?"rinse":(k==D_PK_TRIGGER)?"trigger":(k==D_PK_DISPENSE)?"dispense":"?"; }
 void d_armPending(uint8_t k, uint32_t extraMs){ DISP.pend.kind=k; DISP.pend.printedTimeout=false; DISP.pend.nextPollDue=millis()+STATUS_POLL_MS; DISP.pend.deadline=millis()+extraMs; DISP.pend.active=true; }
 void d_clearPending(){ DISP.pend.kind=D_PK_NONE; DISP.pend.deadline=0; DISP.pend.nextPollDue=0; DISP.pend.printedTimeout=false; DISP.pend.active=false; }
 
 bool d_pollStatusOnce(uint16_t* R) {
   uint16_t W[2] = { D_OP_STATUS, 0 };
-  return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 2, R, RES_QTY, 600, /*verbose*/false);
+  return mbReadWriteMultiple(DISP.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 2, R, RES_QTY, 600, false);
 }
 
-/* Explicit status (prints once) */
+
 bool d_status(bool forcePrint=false){
   uint16_t r[RES_QTY];
   if (d_api_status(r, 1000)){
@@ -428,7 +381,7 @@ bool d_status(bool forcePrint=false){
       if (r[4]) { Serial.print(F(" | weight_g=")); Serial.print(r[4]/10.0f,1); }
       Serial.println();
     } else {
-      // background: finalize pending if transitioned
+      
       if (DISP.pend.active && r[2] != SYS_ACTIVE){
         if (r[2]==SYS_IDLE) {
           Serial.print('['); Serial.print(d_pendingLabel(DISP.pend.kind)); Serial.println(F("] done."));
@@ -486,9 +439,7 @@ void d_servicePending(){
   DISP.pend.nextPollDue = millis() + STATUS_POLL_MS;
 }
 
-/* =========================================================================================
-   CLEANER (ID=2)
-   ========================================================================================= */
+
 
 struct DeviceClean {
   const char* name = "CLEANER";
@@ -497,7 +448,7 @@ struct DeviceClean {
   bool abortRequested = false;
 } CLEAN;
 
-/* [sent] echoes */
+
 static void c_logSent_STATUS() { Serial.println(F("-------------\n[sent] STATUS.")); }
 static void c_logSent_CLEAR()  { Serial.println(F("-------------\n[sent] CLEAR.")); }
 static void c_logSent_ABORT()  { Serial.println(F("-------------\n[sent] ABORT.")); }
@@ -515,7 +466,7 @@ static void c_logSent_CLEAN(float tValve, float tSteam, float tStandby) {
   Serial.print(F(" tStandby_s=")); Serial.print(tStandby,1); Serial.println(F("."));
 }
 
-/* Brief result line (adds tempC/elapsed if present) */
+
 void c_printResultBrief(const uint16_t* R) {
   Serial.print(F("result=")); Serial.print(R[0]==RC_OK ? F("OK") : F("FAIL"));
   Serial.print(F("  error=")); Serial.print(errStr(R[1]));
@@ -524,7 +475,7 @@ void c_printResultBrief(const uint16_t* R) {
   Serial.println();
 }
 
-/* API wrappers (seq=0) */
+
 bool c_api_status(uint16_t* outRegs, uint32_t timeoutMs=600) {
   uint16_t W[2] = { C_OP_STATUS, 0 };
   return mbReadWriteMultiple(CLEAN.id, REG_RES_BASE, RES_QTY, REG_CMD_BASE, W, 2, outRegs, RES_QTY, timeoutMs);
@@ -579,7 +530,7 @@ bool c_api_clean(float tValve, float tSteam, float tStandby, uint16_t* outRegs) 
   return ok;
 }
 
-/* Explicit status (prints once) */
+
 bool c_status(bool forcePrint=false){
   uint16_t r[RES_QTY];
   if (c_api_status(r, 1000)){
@@ -607,7 +558,7 @@ bool c_status(bool forcePrint=false){
   return false;
 }
 
-/* Pending scheduler */
+
 const char* c_pendingLabel(uint8_t k){ return (k==1)?"init":(k==2)?"froth":(k==3)?"clean":"?"; }
 void c_armPending(uint8_t k, uint32_t extraMs){ CLEAN.pend.kind=k; CLEAN.pend.printedTimeout=false; CLEAN.pend.nextPollDue=millis()+STATUS_POLL_MS; CLEAN.pend.deadline=millis()+extraMs; CLEAN.pend.active=true; }
 
@@ -648,9 +599,7 @@ void c_servicePending(){
   CLEAN.pend.nextPollDue = millis() + STATUS_POLL_MS;
 }
 
-/* =========================================================================================
-   CLI + SCHEDULER
-   ========================================================================================= */
+
 
 String inLine;
 
@@ -660,8 +609,8 @@ void printHelp() {
   Serial.println(F("  d.clear"));
   Serial.println(F("  d.abort"));
   Serial.println(F("  d.rinse <seconds>"));
-  Serial.println(F("  d.trigger <motorId|name> <seconds>   e.g. 'd.trigger 22 1.0' or 'd.trigger Sauce2 1.0'"));
-  Serial.println(F("  d.dispense <motorId|name> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>"));
+  Serial.println(F("  d.trigger <motorId|name> <seconds> [s|speed]   e.g. 'd.trigger 22 1.0 s' or 'd.trigger Sauce2 1.0 speed'"));
+  Serial.println(F("  d.dispense <motorId|name> <target_g> <slowPct0-100> <viscousPct0-100> <timeout_s>"));
   Serial.println(F("  c.status"));
   Serial.println(F("  c.clear"));
   Serial.println(F("  c.abort"));
@@ -678,13 +627,13 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) {}
 
-  RS485.begin(BUS_BAUD);     // 8N1 default
+  RS485.begin(BUS_BAUD);     
   delay(50);
 
   Serial.println(F("\nNano Every Modbus Master ready (Dispenser+Cleaner)."));
   printHelp();
 
-  // Quick probes
+  
   uint16_t R[RES_QTY] = {0};
   Serial.print(F("\n[boot] Probing Dispenser STATUS...\n"));
   if (d_api_status_logged(R, 1500)) { Serial.println(F("Modbus OK")); d_printResultBrief(R); }
@@ -696,11 +645,11 @@ void setup() {
 }
 
 void loop() {
-  // Background pending schedulers (silent unless completion/timeout)
+  
   d_servicePending();
   c_servicePending();
 
-  // Non-blocking CLI
+  
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c=='\r') continue;
@@ -710,7 +659,7 @@ void loop() {
       String cmd = inLine; inLine = "";
       String low = cmd; low.toLowerCase();
 
-      // DISPENSER commands
+      
       if (low == "d.status") {
         uint16_t R[RES_QTY]={0};
         d_logSent_STATUS();
@@ -736,7 +685,7 @@ void loop() {
           uint16_t R[RES_QTY]={0};
           bool ok = d_api_rinse(secs, R);
           if (!ok) {
-            // salvage: if active, proceed
+            
             if (d_salvage_accept(R, D_PK_RINSE)) ok = true;
           }
           if (!ok) Serial.println(F("[rinse] NO RESPONSE / CRC/timeout"));
@@ -753,16 +702,30 @@ void loop() {
         if (DISP.pend.active) { Serial.println(F("[busy] operation in progress; type 'd.abort' or 'd.status'.")); }
         else {
           String rest = cmd.substring(10); rest.trim();
-          int sp = rest.indexOf(' ');
-          if (sp < 0) { Serial.println(F("Use: d.trigger <motorId|name> <seconds>")); }
+          int sp1 = rest.indexOf(' ');
+          if (sp1 < 0) { Serial.println(F("Use: d.trigger <motorId|name> <seconds> [s|speed]")); }
           else {
-            String tok = rest.substring(0,sp); tok.trim();
-            String ssec = rest.substring(sp+1); ssec.trim();
+            String tok  = rest.substring(0, sp1); tok.trim();
+            String tail = rest.substring(sp1+1); tail.trim();
+
+            int sp2 = tail.indexOf(' ');
+            String ssec, smod;
+            if (sp2 < 0) { ssec = tail; smod = ""; }
+            else { ssec = tail.substring(0, sp2); smod = tail.substring(sp2+1); smod.trim(); }
+
+            bool highSpeed = false;
+            if (smod.length()) {
+              String ml = smod; ml.toLowerCase();
+              if (ml == "s" || ml == "speed") highSpeed = true;
+              else { Serial.println(F("Use: d.trigger <motorId|name> <seconds> [s|speed]")); goto _after_cli; }
+            }
+
             uint16_t motorId;
             if (!motorTokenToId(tok, motorId)) { Serial.println(F("[err] unknown motor token")); goto _after_cli; }
             float secs = ssec.toFloat();
+
             uint16_t R[RES_QTY]={0};
-            bool ok = d_api_trigger(motorId, secs, R);
+            bool ok = d_api_trigger(motorId, secs, highSpeed, R);
             if (!ok) {
               if (d_salvage_accept(R, D_PK_TRIGGER)) ok = true;
             }
@@ -786,7 +749,7 @@ void loop() {
           int sp3 = rest.indexOf(' ', sp2+1);
           int sp4 = rest.indexOf(' ', sp3+1);
           if (sp1<0 || sp2<0 || sp3<0 || sp4<0) {
-            Serial.println(F("Use: d.dispense <motorId|name> <target_g> <slowPct0-100> <softCut0-100> <timeout_s>"));
+            Serial.println(F("Use: d.dispense <motorId|name> <target_g> <slowPct0-100> <viscousPct0-100> <timeout_s>"));
           } else {
             String tok      = rest.substring(0, sp1); tok.trim();
             float target_g  = rest.substring(sp1+1, sp2).toFloat();
@@ -814,7 +777,7 @@ void loop() {
         }
       }
 
-      // CLEANER commands
+      
       else if (low == "c.status") {
         uint16_t R[RES_QTY]={0};
         c_logSent_STATUS();
@@ -849,7 +812,7 @@ void loop() {
             c_printResultBrief(R);
             if (R[0]==RC_OK && R[2]==SYS_ACTIVE) {
               uint32_t guard = 5000UL;
-              c_armPending(/*init*/1, (uint32_t)(secs*1000.0f)+guard);
+              c_armPending(1, (uint32_t)(secs*1000.0f)+guard);
             }
           }
         }
@@ -869,7 +832,7 @@ void loop() {
               c_printResultBrief(R);
               if (R[0]==RC_OK && R[2]==SYS_ACTIVE) {
                 uint32_t guard = 10000UL;
-                c_armPending(/*froth*/2, (uint32_t)(tout*1000.0f)+guard);
+                c_armPending(2, (uint32_t)(tout*1000.0f)+guard);
               }
             }
           }
@@ -892,7 +855,7 @@ void loop() {
             if (R[0]==RC_OK && R[2]==SYS_ACTIVE) {
               uint32_t guard = 10000UL;
               uint32_t total = (uint32_t)((tValve + tSteam + tStby)*1000.0f) + guard;
-              c_armPending(/*clean*/3, total);
+              c_armPending(3, total);
             }
           }
         }
@@ -905,7 +868,7 @@ void loop() {
       }
 
 _after_cli:
-      // Immediately tick schedulers once for snappy feedback
+      
       d_servicePending();
       c_servicePending();
 
@@ -914,7 +877,7 @@ _after_cli:
     }
   }
 
-  // Idle ticks
+  
   d_servicePending();
   c_servicePending();
 }
